@@ -102,6 +102,7 @@ Applied at build time from `image/patches/`.
 | `spark_mem_trace.py` | Names whatever crosses that bound, instead of leaving an OOM anonymous. | ours |
 | `link_cuda_headers.sh` | Symlinks the CUDA headers where nvcc looks. The base ships a trimmed `/usr/local/cuda/include`: the libraries are present, the matching headers are not. Without it a JIT compile dies at link time with no obvious cause. | ours |
 | `verify.py` | Asserts at **build** time that the SM121 patches landed, reading files as text — an import-based check cannot work, since `vllm.platforms.cuda` needs a driver that does not exist during `docker build`. A base-image change fails the build rather than silently producing a half-patched tree. | ours |
+| `scripts/patch-thinking-budget.sh` | `thinking_token_budget` is applied inside `apply_sampling_params`, which the V2 sampler skips unless `_requires_logits_processing()` is true — and that predicate never checks the budget. Temperature 0 (greedy) and temperature 1 (this model's `generation_config` default) miss every other condition, so the budget is silently ignored on the most common requests. Measured at budget 16: temp 0 → 1426 chars, temp 1.0 → 1996, temp 0.6 → 61. Adds the missing condition; upstream main fixes the same gap with a per-request `needs_logits_processing` flag. | ours, after [vllm#50473](https://github.com/vllm-project/vllm/issues/50473) |
 | `scripts/patch-spin-wait.sh` | vLLM's shm queue spins for `busy_loop_s` after the last message before it will block on zmq. The default is 1 s and decode messages arrive every few ms, so the blocking path is never taken and the cores spin at full power. On GB10 the CPU and GPU share one package, so that heat comes out of the GPU's budget. 1 → 0.002 cut vLLM CPU 185%→109%, the SoC ~20 °C, and *raised* decode 66.9→70.6 tok/s. 0 (always block) is cooler and 11% slower — the short spin is worth keeping. | [nacyot](https://artifacts.nacyot.com/vllm-spin-wait-gb10-en/) |
 
 ## Troubleshooting
@@ -134,6 +135,11 @@ lists the agent yet marks it `alive=false degraded=true`, while that node's own
 daemon sees only its own agent. The GPU gate asks whichever daemon it was told
 about, so it never counts more than one. Confirm with `mentatd status` on the
 head — every agent should read `alive=true`.
+
+**`thinking_token_budget` does nothing.** It is silently skipped on the V2
+runner whenever `temperature` is 0 or 1 — see Patches. Either apply
+`scripts/patch-thinking-budget.sh`, or send `temperature` outside {0, 1} as a
+zero-patch workaround.
 
 **The first request after a cold boot takes minutes.** Triton JIT compiling
 DFlash2 shapes mid-serve; `jit_monitor` names them in the log. Send one
