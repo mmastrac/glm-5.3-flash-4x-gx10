@@ -43,7 +43,7 @@ services:
       # when the NAS is awake will eventually fail to start.
       - ${MODEL_HOST_DIR:-/home/admin/models/glm-5.3-flash-nvfp4}:/models/glm-5.3-flash-nvfp4:ro
       # LibertAI's sparse-MLA kernel, built for sm_121a and installed to
-      # /home/admin/ext. Two vllm.general_plugins entry points, both inert
+      # ${SPARK_HOME:-/home/admin}/ext. Two vllm.general_plugins entry points, both inert
       # unless their env var is set, so mounting it changes nothing on its own.
       - ${EXT_DIR:-/home/admin/ext}:/opt/ext:ro
       # JIT/autotune caches. WITHOUT this they live inside the container and are

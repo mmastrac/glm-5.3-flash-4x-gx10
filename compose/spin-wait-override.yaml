@@ -7,4 +7,4 @@
 services:
   glm53:
     volumes:
-      - /home/admin/spin-patch/shm_broadcast.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/shm_broadcast.py:ro
+      - ${SPARK_HOME:-/home/admin}/spin-patch/shm_broadcast.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/shm_broadcast.py:ro

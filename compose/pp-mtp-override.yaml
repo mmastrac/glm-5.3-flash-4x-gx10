@@ -1,15 +1,15 @@
 services:
   glm53:
     volumes:
-      - /home/admin/pp-patches/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py:ro
-      - /home/admin/pp-patches/mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/mtp.py:ro
-      - /home/admin/pp-patches/model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
-      - /home/admin/pp-patches/pp_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/pp_utils.py:ro
-      - /home/admin/pp-patches/parallel_state.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py:ro
-      - /home/admin/pp-patches/speculative.py:/usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py:ro
-      - /home/admin/pp-patches/ray_executor_v2.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/ray_executor_v2.py:ro
-      - /home/admin/pp-patches/pynccl_wrapper.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/pynccl_wrapper.py:ro
-      - /home/admin/pp-patches/pynccl.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/pynccl.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/mtp.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/pp_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/pp_utils.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/parallel_state.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/speculative.py:/usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/ray_executor_v2.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/ray_executor_v2.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/pynccl_wrapper.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/pynccl_wrapper.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches/pynccl.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/pynccl.py:ro
     environment:
       - GRAPH_TEST=${GRAPH_TEST:-0}
       - CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-}

@@ -1,16 +1,16 @@
 services:
   glm53:
     volumes:
-      - /home/admin/models/glm-5.3-flash-dflash2:/models/glm-5.3-flash-dflash2:ro
-      - /home/admin/pp-patches-dflash/glm53-chat-template.jinja:/usr/local/share/glm53-chat-template.jinja:ro
-      - /home/admin/pp-patches-dflash/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py:ro
-      - /home/admin/pp-patches-dflash/model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
-      - /home/admin/pp-patches-dflash/dflash_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/utils.py:ro
-      - /home/admin/pp-patches-dflash/qwen3_dflash2.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash2.py:ro
-      - /home/admin/pp-patches-dflash/dflash2_speculator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/dflash2_speculator.py:ro
-      - /home/admin/pp-patches-dflash/registry.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py:ro
-      - /home/admin/pp-patches-dflash/spec_decode_init.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/__init__.py:ro
-      - /home/admin/pp-patches-dflash/kv_cache_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py:ro
+      - ${SPARK_HOME:-/home/admin}/models/glm-5.3-flash-dflash2:/models/glm-5.3-flash-dflash2:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/glm53-chat-template.jinja:/usr/local/share/glm53-chat-template.jinja:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/model.py:/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/dflash_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/utils.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/qwen3_dflash2.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash2.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/dflash2_speculator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/dflash2_speculator.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/registry.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/spec_decode_init.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/__init__.py:ro
+      - ${SPARK_HOME:-/home/admin}/pp-patches-dflash/kv_cache_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py:ro
     environment:
       - VLLM_GLM5NEXT_DRAFT_BLOCK_SIZE=2304
       - 'EXTRA_ARGS=--kv-cache-memory=30064771072 --speculative-config {"method":"dflash","model":"/models/glm-5.3-flash-dflash2","num_speculative_tokens":7}'
