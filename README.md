@@ -41,10 +41,28 @@ Build with `docker build -t glm53-spark:sm90-v21 image/` — it compiles nothing
 the vLLM `glm5_next` per-model image is the base — and run
 `scripts/patch-spin-wait.sh` once before first boot.
 
-Each container also serves a status page and a set of engine MCP tools on
-`:8082` (`status-server.py`), which is what `MENTAT_MCP_API` points at. Use it
-to read engine state, memory accounting and the KV pool without attaching to
-the container.
+## Diagnostics
+
+Each container runs `status-server.py` on `:8082` from container start — before
+the model is loadable, so there is something to read during the ~9 minute weight
+load. It does not proxy inference. `MENTAT_MCP_API` points at it. Eleven MCP
+tools: `node_status`, `cluster_status`, `serve_args`, `ray_status`, `metrics`,
+`throughput`, `latency_percentiles`, `cache_sizes`, `versions`, and
+`find_files` / `search_files` over a fixed set of roots.
+
+> **`:8082` is unauthenticated and binds `0.0.0.0`.** Anyone who can reach the
+> port can read engine state and search file contents under `SEARCH_ROOTS`
+> (`/src/vllm,/root/.cache,/logs,/cache` by default). Paths are resolved with
+> `realpath` so symlinks cannot escape those roots, arguments are passed as
+> argv rather than through a shell, and output is capped at 16 KB — but there
+> is no authentication. Fine on an isolated fabric; put it behind something, or
+> narrow `SEARCH_ROOTS`, on any network you do not control.
+
+Host-level facts — GPU, PCI, RDMA counters, memory accounting, dmesg, systemd —
+come from a separate per-machine agent that is **not** part of this recipe. It
+runs outside the container because those facts are the host's, and it
+authenticates with the mesh key. The container tools above cover the engine;
+diagnosing the fabric or the box needs that agent or plain ssh.
 
 ## Tuning
 
