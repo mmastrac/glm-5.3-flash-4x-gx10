@@ -1,0 +1,69 @@
+# mentatd: the host-level mentat daemon, one per GB10 box. Deploy to
+# ~/compose/mentatd/ on each node with a per-node .env:
+#
+#   gx10-n1 (.env): MENTAT_NODE_IP=10.100.0.2
+#                     MENTAT_PEERS=10.100.0.1:6379,192.168.1.13:6379
+#   gx10-n2 (.env): MENTAT_NODE_IP=10.100.0.1
+#                     MENTAT_PEERS=10.100.0.2:6379,192.168.1.13:6379
+#   gx10-n3 (.env): MENTAT_NODE_IP=192.168.1.13
+#                     MENTAT_PEERS=192.168.1.11:6379,192.168.1.12:6379
+#
+# MENTAT_NODE_IP is this node's CLUSTER identity -- on the serving pair that
+# is the ConnectX 10.100.0.x address (matching VLLM_HOST_IP inside the model
+# containers), NOT the LAN address. Left empty the daemon derives its identity
+# from the default route, which lands on 192.168.1.x and breaks the
+# driver-node match on the pair. n3 has no QSFP link, so its LAN address IS
+# its cluster identity, and it must dial the pair by their LAN addresses --
+# the mesh dedupes by node id, not by the address a link happened to use.
+#
+# Must be running before any converted model container starts: the containers'
+# `ray start` registers with this daemon on 127.0.0.1:6379 (retrying, so
+# ordering only delays them, never kills them).
+services:
+  mentatd:
+    image: ${IMAGE:-mentatd:0.1.0}
+    container_name: mentatd
+    # Host networking on purpose: the control port must be reachable both at
+    # 127.0.0.1:6379 (agents in host-network model containers) and on the
+    # cluster subnets (the worker's agent and the mesh).
+    network_mode: host
+    restart: unless-stopped
+    # The HMAC key when it lives in a file. Point MENTAT_SECRET_HOST_FILE at
+    # the key on the host and set MENTAT_SECRET_FILE=/run/mentat/secret.
+    # Unset, this mounts /dev/null, which reads empty and costs nothing.
+    volumes:
+      - ${MENTAT_SECRET_HOST_FILE:-/dev/null}:/run/mentat/secret:ro
+    environment:
+      - MENTAT_NODE_IP=${MENTAT_NODE_IP:-}
+      - MENTAT_PEERS=${MENTAT_PEERS:-}
+      # Lifecycle tuning, all optional, in milliseconds. Defaults in README
+      # "Tuning" and rust/src/config.rs. Set in the per-node .env only when
+      # deviating from the defaults.
+      - MENTAT_PG_PENDING_TIMEOUT_MS=${MENTAT_PG_PENDING_TIMEOUT_MS:-}
+      - MENTAT_AGENT_DEGRADED_AFTER_MS=${MENTAT_AGENT_DEGRADED_AFTER_MS:-}
+      - MENTAT_AGENT_DEAD_AFTER_MS=${MENTAT_AGENT_DEAD_AFTER_MS:-}
+      - MENTAT_PEER_STALE_AFTER_MS=${MENTAT_PEER_STALE_AFTER_MS:-}
+      - MENTAT_PEER_DEAD_AFTER_MS=${MENTAT_PEER_DEAD_AFTER_MS:-}
+      - MENTAT_ELECTION_HOLD_DOWN_MS=${MENTAT_ELECTION_HOLD_DOWN_MS:-}
+      - MENTAT_PEER_STATUS_INTERVAL_MS=${MENTAT_PEER_STATUS_INTERVAL_MS:-}
+      - MENTAT_SLOW_CALL_WARN_MS=${MENTAT_SLOW_CALL_WARN_MS:-}
+      - MENTAT_SESSION_REAP_GRACE_MS=${MENTAT_SESSION_REAP_GRACE_MS:-}
+      - MENTAT_TCP_DEAD_AFTER_MS=${MENTAT_TCP_DEAD_AFTER_MS:-}
+      # UDP self-announcement for mentatd-serve discovery. Empty = broadcast
+      # on port 6382 every 5s; 0 disables. MENTAT_ANNOUNCE_ADDR adds
+      # unicast targets for a listener outside every broadcast domain.
+      - MENTAT_ANNOUNCE_PORT=${MENTAT_ANNOUNCE_PORT:-}
+      - MENTAT_ANNOUNCE_ADDR=${MENTAT_ANNOUNCE_ADDR:-}
+      # Interfaces to announce on. Empty picks every up non-loopback
+      # interface except the container bridges.
+      - MENTAT_ANNOUNCE_IFACES=${MENTAT_ANNOUNCE_IFACES:-}
+      - MENTAT_ISLAND_PLACEMENT=${MENTAT_ISLAND_PLACEMENT:-}
+      # HMAC key for announcements, matching spark-agent's mesh discovery.
+      # Unset leaves them unsigned. A file keeps the key out of the
+      # environment.
+      - MENTAT_SECRET=${MENTAT_SECRET:-}
+      # Set this to /run/mentat/secret to use the mount above. A path
+      # that reads empty turns signing off, even with MENTAT_SECRET set.
+      - MENTAT_SECRET_FILE=${MENTAT_SECRET_FILE:-}
+      # Cluster name. Foreign universes are dropped without a log line.
+      - MENTAT_UNIVERSE=${MENTAT_UNIVERSE:-}
