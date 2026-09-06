@@ -36,12 +36,18 @@ once before first boot.
 
 ## Five things that are not obvious
 
-**Drain the flea power after plugging the DAC cables.** The ConnectX-7 latches a
-slow fallback state when cables are hot-plugged. Every link reports 200G and
-`ib_write_bw` reads a healthy 109 Gb/s, but NCCL all-reduce crawls at 12 Gb/s and
-prefill runs at half speed. A reboot does not clear it and neither does a NIC
-hotplug reset — only powering off and pulling the cords. Symptom to look for:
-NCCL Tree faster than Ring. Healthy is Ring 110 Gb/s, Tree 44.
+**After plugging in the DAC cables, power off and unplug for a minute.** The
+ConnectX-7 latches a slow fallback state when cables are hot-plugged, and a
+reboot does not clear it — the machine has to lose power entirely, cord out,
+long enough for the residual charge to drain. A NIC hotplug reset does not
+clear it either.
+
+While it is latched every link still reports 200G, `ib_write_bw` still reads a
+healthy 109 Gb/s, and no error counter moves — but NCCL all-reduce crawls at
+12 Gb/s and prefill runs at half speed. A single unidirectional stream cannot
+see it; a ring collective, sending and receiving at once, can.
+
+The tell is that NCCL Tree beats Ring. Healthy is Ring 110 Gb/s, Tree 44.
 
 **`LONG_PREFILL_TOKEN_THRESHOLD` must be a multiple of 2304.** That is the KDA
 block size, and prefix caching snaps chunk ends to it. 2048 produces alternating
