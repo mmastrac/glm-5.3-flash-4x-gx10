@@ -27,8 +27,15 @@ cp .env.example .env        # on every node; set ROLE, and SPARK_HOME if not /ho
 ```
 
 `up.sh` starts mentatd on every node, mentatd-serve on the head, then vLLM
-everywhere, and waits for `:8002`. The OpenAI endpoint is `:8002` on the head
-directly, or `:6381` through mentatd-serve, which also routes other models.
+everywhere, and waits for `:8002`.
+
+**Point clients at mentatd-serve on `:6381`, not at vLLM on `:8002`.** It is a
+single OpenAI endpoint for the whole cluster: it health-gates, so a request
+during a boot or a reload queues instead of failing, and it routes by model
+name, so the other models on the fleet answer on the same address. `:8002` is
+one rank of one model and moves whenever the head does. mentatd-serve is a
+separate process from the daemon by design — nothing that routes inference
+traffic runs inside the thing that holds cluster membership.
 
 Build the image with `image/Dockerfile` — it compiles nothing, the vLLM
 `glm5_next` per-model image is the base — and run `scripts/patch-spin-wait.sh`
