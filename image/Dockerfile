@@ -30,7 +30,7 @@ ARG BASE=vllm/vllm-openai:glm53-flash-arm64-cu130
 # Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
 # local image, and those have been mislabelled before -- every image "pinned"
 # to 0.4.0 silently ran 0.1.0. Verify with `mentatd --version`, never the tag.
-ARG MENTAT_VERSION=0.6.0
+ARG MENTAT_VERSION=0.7.0
 FROM mmastrac/mentat-artifacts:${MENTAT_VERSION} AS mentat
 FROM ${BASE}
 
