@@ -102,6 +102,14 @@ prompt, and identical under both MoE kernels, both attention backends, and with
 speculation off. The compressed-tensors builds (RedHatAI NVFP4, INT4 AWQ) are
 clean on the same stack. Independently reported by tonyd2wild.
 
+**Boot hangs at `waiting for 4 GPUs, have 1`.** Every node must set `HEAD_HOST`
+to the head, not to itself. mentat replicates an agent's *registration* across
+the mesh but not its *liveness*: point a node at its own daemon and the head
+lists the agent yet marks it `alive=false degraded=true`, while that node's own
+daemon sees only its own agent. The GPU gate asks whichever daemon it was told
+about, so it never counts more than one. Confirm with `mentatd status` on the
+head — every agent should read `alive=true`.
+
 **The first request after a cold boot takes minutes.** Triton JIT compiling
 DFlash2 shapes mid-serve; `jit_monitor` names them in the log. Send one
 throwaway request before timing anything.
