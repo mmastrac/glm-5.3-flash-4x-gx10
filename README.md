@@ -37,9 +37,14 @@ one rank of one model and moves whenever the head does. mentatd-serve is a
 separate process from the daemon by design — nothing that routes inference
 traffic runs inside the thing that holds cluster membership.
 
-Build the image with `image/Dockerfile` — it compiles nothing, the vLLM
-`glm5_next` per-model image is the base — and run `scripts/patch-spin-wait.sh`
-once before first boot.
+Build with `docker build -t glm53-spark:sm90-v21 image/` — it compiles nothing,
+the vLLM `glm5_next` per-model image is the base — and run
+`scripts/patch-spin-wait.sh` once before first boot.
+
+Each container also serves a status page and a set of engine MCP tools on
+`:8082` (`status-server.py`), which is what `MENTAT_MCP_API` points at. Use it
+to read engine state, memory accounting and the KV pool without attaching to
+the container.
 
 ## Tuning
 
@@ -67,6 +72,8 @@ about 5% and buys nothing when every step has several requests in it anyway.
 
 Runtime patches applied to the stock image. All of them gate paths that already
 exist onto GB10 rather than writing kernels.
+
+Applied at build time from `image/patches/`.
 
 | file | what it does | source |
 |---|---|---|
@@ -123,8 +130,9 @@ unless the compose file passes it through.
 
 ```
 compose/    glm53.yaml + three override files, mentatd, mentatd-serve
-image/      Dockerfile, entrypoint, chat template
-patches/    the table above
+image/      the whole build context: Dockerfile, entrypoint, chat template,
+            status-server.py (status page + engine MCP tools on :8082),
+            self-test.py, and patches/
 scripts/    up.sh, down.sh, patch-spin-wait.sh
 ```
 
