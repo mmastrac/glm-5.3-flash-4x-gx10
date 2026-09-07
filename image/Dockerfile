@@ -30,7 +30,7 @@ ARG BASE=vllm/vllm-openai:glm53-flash-arm64-cu130
 # Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
 # local image, and those have been mislabelled before -- every image "pinned"
 # to 0.4.0 silently ran 0.1.0. Verify with `mentatd --version`, never the tag.
-ARG MENTAT_VERSION=0.7.0
+ARG MENTAT_VERSION=0.6.0
 FROM mmastrac/mentat-artifacts:${MENTAT_VERSION} AS mentat
 FROM ${BASE}
 
@@ -88,6 +88,12 @@ RUN python3 /tmp/gb10_plugin_backend.py && rm /tmp/gb10_plugin_backend.py
 COPY patches/spark_mem_trace.py /usr/local/lib/python3.12/dist-packages/spark_mem_trace.py
 COPY patches/worker_memory_cap.py /tmp/worker_memory_cap.py
 RUN python3 /tmp/worker_memory_cap.py && rm /tmp/worker_memory_cap.py
+
+# The V2 sampler's fast-path guard never checked thinking_token_budget, so on a
+# greedy or default request the budget was recorded and never applied. Add the
+# clause upstream main has since added -- see the script.
+COPY patches/thinking_budget_guard.py /tmp/thinking_budget_guard.py
+RUN python3 /tmp/thinking_budget_guard.py && rm /tmp/thinking_budget_guard.py
 
 # The base is a single-node serving image, so it is missing two things this
 # cluster needs. Both are cheap; neither is optional.
