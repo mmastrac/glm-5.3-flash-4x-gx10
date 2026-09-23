@@ -552,7 +552,7 @@ def cluster_rows():
             #            ConnectX link. Private to the pair and not resolvable
             #            from anywhere else, so it must never be a link target.
             #   name  -- how a READER reaches the peer: the box's real hostname
-            #            (gx10-2353), which is what resolves on the LAN.
+            #            (e.g. gx10-node2), which is what resolves on the LAN.
             # Falls back to the poll address only when the peer is down and has
             # therefore not told us its hostname.
             "name": p.get("host") or addr.rsplit(":", 1)[0],

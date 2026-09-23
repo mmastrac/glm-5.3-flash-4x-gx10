@@ -1,164 +1,180 @@
-# GLM-5.3-Flash NVFP4 on ASUS GX10 / GB10 (SM121a), TP=2 over RoCE.
+# GLM-5.3-Flash NVFP4 on ASUS GX10 / GB10 (sm_121), TP=4 over RoCE.
 #
-# Unlike ds4-flash/Dockerfile this compiles NOTHING. GLM-5.3-Flash landed on
-# 2026-08-26 and its glm5_next architecture is not in any vLLM release -- support
-# is PR vllm-project/vllm#53906, which vLLM ships ahead of the merge as a
-# per-model image. That image is the base here, so the ~67 min SM12x build the
-# DS4 image pays for is simply not incurred.
+# Built on a stock vLLM NIGHTLY. GLM-5.3-Flash (glm5_next) landed on main, so
+# the per-model pre-merge image this used to start from
+# (vllm/vllm-openai:glm53-flash-arm64-cu130) is no longer needed, and neither
+# are most of the patches that sat on top of it. Audited 2026-09-22 against
+# nightly 0961bbae, patch by patch:
 #
-# GB10 is NOT on the vendor's verified list (H100/B200/GB200 are), which reads
-# like a blocker and is not one. The base image's TORCH_CUDA_ARCH_LIST stops at
-# 12.0 while GB10 is sm_121, but its torch reports
-#   ['sm_80','sm_90','sm_100','sm_110','sm_120']
-# which is byte-identical to the torch in the ds4-flash image already serving on
-# these boxes -- sm_120 cubins run on sm_121. Verified by inspection on
-# gx10-9722 before this file was written. Do not "fix" the arch list.
+#   dropped, now upstream:
+#     thinking_budget_guard.py      the V2 sampler applies thinking_token_budget
+#     kpool-fix indexer.py          tail slot mapping written into a persistent
+#                                   buffer (out=slot_mapping_buffer)
+#     kpool-fix mamba_hybrid.py     positions= passed to build_attn_metadata
+#     dflash registry/qwen3_dflash2/speculator/spec_decode_init
+#   dropped, now a flag:
+#     gb10_topk_fallback.py         --sparse-indexer-topk-backend per_row
+#   dropped, no longer needed:
+#     flashinfer nightly pin        the nightly ships 0.6.18.post1
+#     NCCL 2.30.7 pin               the nightly ships 2.30.7
+#     cutlass-dsl 4.6.2 pin         the nightly ships 4.7.1; watch this one
+#     model_runner.py mount         PP-only; this runs PP=1
+#   added:
+#     glm53_mtp_bf16.py             MTP layer is BF16 but config.json says NVFP4
+#     sm90_fp8_kv_dtype.py          SM90 builder planned fp8 KV as uint8
+#     glm53_reasoning_always_parsed.py  thinking off = low effort, still <think>
+#   kept:
+#     glm53-flash_SM121.py (MiaAI)  6 of 7 edits apply unchanged; see below
+#     gb10_plugin_backend.py        MiaAI vs LibertAI sparse-MLA switch
+#     worker_memory_cap.py          ours: TORCH_MEM_FRACTION
+#     spin_wait.py                  was a whole-file shm_broadcast.py mount
+#     glm47_failclosed.py           tool parser plugin, import path ported
+#     glm53_eagle3_aux.py           upstream GLM5next exposes no aux hidden states;
+#                                   retargeted to models/glm5next/common/model.py
+#     glm53_dflash2_kv_groups.py    drafter KV groups on the GLM-5-Next layout
+#                                   (the old whole-file kv_cache_utils.py fork,
+#                                   reduced to what the nightly lacks)
 #
-# The stock image alone is NOT sufficient, which cost a working configuration to
-# learn. It offers only FLASHINFER_MLA_SPARSE_SM120 on compute capability 12,
-# and that backend mandates the packed fp8_ds_mla layout with pe_dim == 64.
-# This checkpoint is NoPE (qk_rope_head_dim: 0), so the kernel refuses and the
-# engine dies in concat_and_cache_mla -- after a full ~10 minute weight load.
-# Setting --kv-cache-dtype auto does not help: the backend coerces it back.
-#
-# patches/glm53-flash_SM121.py (MIT, MiaAI-Lab) is what closes that gap. See
-# patches/README.md; the short version is that the SM90 sparse-MLA backend is
-# not inherently Hopper-only -- its FA3 kernel is, but FA2 is portable to
-# sm_12x -- so the fix is gating that path onto capability 12 rather than
-# writing a new kernel.
-ARG BASE=vllm/vllm-openai:glm53-flash-arm64-cu130
+# GB10 is sm_121 and this torch reports up to sm_120. That is correct: sm_120
+# cubins run on sm_121. Do not widen TORCH_CUDA_ARCH_LIST.
+ARG BASE=vllm/vllm-openai:nightly-0961bbae2894d574be790d219651824eb199318e
 # Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
 # local image, and those have been mislabelled before -- every image "pinned"
-# to 0.4.0 silently ran 0.1.0. Verify with `mentatd --version`, never the tag.
-ARG MENTAT_VERSION=0.6.0
+# to 0.4.0 once silently ran 0.1.0. Verify with `mentatd --version`.
+# 0.7.0 matches the host daemons, and adopts actors across a daemon restart.
+ARG MENTAT_VERSION=0.12.0
+
 FROM mmastrac/mentat-artifacts:${MENTAT_VERSION} AS mentat
 FROM ${BASE}
 
-# --- SM121 kernel layer -----------------------------------------------------
-# Pin order matters: the FlashInfer nightly drags in an older NCCL and skews
-# cutlass-dsl, and both have to be put back for this hardware. The
-# flashinfer-jit-cache package is REMOVED so the image cannot load SM120 cubins
-# and quietly take the packed path we are trying to avoid.
-ARG FLASHINFER_VERSION=0.6.18.dev20260819
-RUN pip install --no-cache-dir --pre \
-        "flashinfer-python==${FLASHINFER_VERSION}" \
-        "flashinfer-cubin==${FLASHINFER_VERSION}" \
-        --extra-index-url https://flashinfer.ai/whl/nightly/ \
-    && pip uninstall -q -y flashinfer-jit-cache \
-    && python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
-
-# The CX7 link between gx10-5818 and gx10-2353 needs this NCCL.
-ARG NCCL_VERSION=2.30.7
-RUN pip install --no-cache-dir "nvidia-nccl-cu13==${NCCL_VERSION}" \
-    && pip show nvidia-nccl-cu13 | grep -q "Version: ${NCCL_VERSION}"
-
-# GB10 CuTeDSL wants this back after the nightly skews it.
-ARG CUTLASS_DSL_VERSION=4.6.2
-RUN pip install --no-cache-dir "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
-    && pip show nvidia-cutlass-dsl | grep -q "Version: ${CUTLASS_DSL_VERSION}"
-
-# Default mode is sm90 (seven patches). Do NOT pass sm120 -- that packed path is
-# the one this model cannot use. The script asserts each replacement matches
-# exactly once and aborts otherwise, so a moved base image fails the build
-# rather than yielding a half-patched tree.
-COPY patches/glm53-flash_SM121.py /tmp/glm53-flash_SM121.py
-RUN python3 /tmp/glm53-flash_SM121.py && rm /tmp/glm53-flash_SM121.py
-
-# GB10 refuses persistent_topk once the KV pool passes roughly 3.4M tokens, and
-# the FilteredTopK fallback it reaches for wants 128 KB of shared memory per
-# block against the 101,376 B an SM has. Gate capability 12 onto
-# top_k_per_row_decode, which is already the else branch at both call sites.
-# Ours rather than MiaAI-Lab's, so their file stays verbatim upstream.
-COPY patches/gb10_topk_fallback.py /tmp/gb10_topk_fallback.py
-RUN python3 /tmp/gb10_topk_fallback.py && rm /tmp/gb10_topk_fallback.py
-
-# nvcc's include path is missing the headers whose libraries this base already
-# ships, which breaks any FlashInfer JIT path -- see the script.
+# nvcc's include path is missing the headers whose libraries this base ships,
+# which breaks any FlashInfer JIT path (nvrtc.h, then -lnvrtc).
 COPY patches/link_cuda_headers.sh /tmp/link_cuda_headers.sh
 RUN bash /tmp/link_cuda_headers.sh && rm /tmp/link_cuda_headers.sh
+
+# --- sm_121 sparse MLA -------------------------------------------------------
+# This checkpoint is NoPE (qk_rope_head_dim 0). On capability 12 the nightly
+# still offers only TRITON_MLA and FLASHINFER_MLA_SPARSE_SM120, and SM120
+# mandates the packed fp8_ds_mla layout, which NoPE cannot use -- the engine
+# dies in concat_and_cache_mla after a ~10 minute weight load. The SM90 backend
+# already covers NoPE (kpe in {0, 64}) but is gated to Hopper; FA3 is, FA2 is
+# not. MiaAI's patcher lists SM90 on capability 12 and swaps FA2 in off Hopper,
+# plus FA2's fp8 gate and CTA tile for ~101 KB smem, PDL off (a KDA race on
+# this hardware), a kpool pid clamp, and initialising the indexer's top-k
+# buffer to -1 instead of torch.empty.
+#
+# That last edit is the only one whose file moved: sparse_attn_indexer_kpool.py
+# became models/glm5next/nvidia/sparse_indexer.py, with the same two
+# allocations byte for byte. The sed retargets MiaAI's path and nothing else,
+# so the vendored file stays verbatim (MIT, licence beside it). The patcher
+# still asserts every anchor matches exactly once.
+COPY patches/glm53-flash_SM121.py patches/LICENSE.MiaAI-Lab /tmp/mia/
+RUN sed -i 's|model_executor/layers/sparse_attn_indexer_kpool.py|models/glm5next/nvidia/sparse_indexer.py|' /tmp/mia/glm53-flash_SM121.py \
+ && python3 /tmp/mia/glm53-flash_SM121.py && rm -rf /tmp/mia
 
 # MiaAI's patcher and LibertAI's plugin both solve the sm_121 MLA problem, and
 # the first shuts the second out. Make the choice an env var -- see the script.
 COPY patches/gb10_plugin_backend.py /tmp/gb10_plugin_backend.py
 RUN python3 /tmp/gb10_plugin_backend.py && rm /tmp/gb10_plugin_backend.py
 
+# The SM90 backend's metadata builder plans FlashInfer's MLA wrapper with
+# kv_cache_spec.dtype, which for an fp8 cache is the uint8 STORAGE dtype, and
+# plan() rejects it at the first autotune run. The pre-merge image passed
+# float8_e4m3fn; this restores that. Not GB10-specific.
+COPY patches/sm90_fp8_kv_dtype.py /tmp/sm90_fp8_kv_dtype.py
+RUN python3 /tmp/sm90_fp8_kv_dtype.py && rm /tmp/sm90_fp8_kv_dtype.py
+
 # Nothing in vLLM bounds a worker's memory, and on unified memory an unbounded
-# worker takes the node down rather than its own request. Same contract as the
-# script above: one anchor or the build fails.
+# worker takes the node down rather than its own request.
 COPY patches/spark_mem_trace.py /usr/local/lib/python3.12/dist-packages/spark_mem_trace.py
 COPY patches/worker_memory_cap.py /tmp/worker_memory_cap.py
 RUN python3 /tmp/worker_memory_cap.py && rm /tmp/worker_memory_cap.py
 
-# The V2 sampler's fast-path guard never checked thinking_token_budget, so on a
-# greedy or default request the budget was recorded and never applied. Add the
-# clause upstream main has since added -- see the script.
-COPY patches/thinking_budget_guard.py /tmp/thinking_budget_guard.py
-RUN python3 /tmp/thinking_budget_guard.py && rm /tmp/thinking_budget_guard.py
+COPY patches/spin_wait.py /tmp/spin_wait.py
+RUN python3 /tmp/spin_wait.py && rm /tmp/spin_wait.py
 
-# The base is a single-node serving image, so it is missing two things this
-# cluster needs. Both are cheap; neither is optional.
-#
-#   iproute2  : the entrypoint finds this node's ConnectX address by scanning
-#               `ip -o -4 addr` for CLUSTER_SUBNET, and derives GLOO_SOCKET_IFNAME
-#               from whichever interface owns it. Without `ip` the entrypoint
-#               cannot start at all -- the pair is asymmetric (5818 carries the
-#               link on enp1s0f1np1, 2353 on enp1s0f0np0), so the discovery is
-#               not replaceable by a hardcoded name.
-#   ibverbs   : NCCL's RoCE data plane. Missing, NCCL silently falls back to
-#               TCP over the 1G LAN and every TP step crawls.
-#
-# ripgrep/pciutils are for the MCP inventory + search tools, matching ds4-flash.
+# DFlash2 reads auxiliary hidden states from target layers 5, 14, 24, 33, 42.
+# Upstream serves the DFlash2 drafter but its GLM5next model exposes no aux
+# states, so without this `--speculative-config dflash` fails at load with
+# "Model does not support EAGLE3 interface". Inert unless a drafter asks for
+# aux layers. Only the target path changed from the vendor-base version.
+COPY patches/glm53_eagle3_aux.py /tmp/glm53_eagle3_aux.py
+RUN python3 /tmp/glm53_eagle3_aux.py && rm /tmp/glm53_eagle3_aux.py
+
+# nvidia/GLM-5.3-Flash-NVFP4 stores its MTP layer (45) in BF16, but its
+# config.json declares every Linear NVFP4 and does not list layer 45 in
+# `ignore`, so MTP dies at load: "size of tensor a (256) must match ... (512)"
+# in RoutedExperts._load_w2. This excludes the MTP layer from quantisation when
+# the checkpoint holds no scales for it -- driven by the weights, so a
+# checkpoint that does quantise its MTP layer is left alone.
+COPY patches/glm53_mtp_bf16.py /tmp/glm53_mtp_bf16.py
+RUN python3 /tmp/glm53_mtp_bf16.py && rm /tmp/glm53_mtp_bf16.py
+
+# Thinking off no longer closes an empty <think></think> (out of distribution for
+# this model; it breaks long structured output). The template maps it to
+# `Reasoning Effort: Low` and still opens <think>, so the reasoning parser must
+# track <think> even when the request says thinking is off.
+COPY patches/glm53_reasoning_always_parsed.py /tmp/glm53_reasoning_always_parsed.py
+RUN python3 /tmp/glm53_reasoning_always_parsed.py && rm /tmp/glm53_reasoning_always_parsed.py
+
+# DFlash2's drafter adds five sliding-window attention layers, and the nightly's
+# GLM-5-Next KV grouper gives up on any spec that is not MLA, so the model falls
+# onto the generic path and dies in unify_kv_cache_spec_page_size ("page size is
+# not divisible by the maximum page size"). This keeps the target's groups and
+# gives the drafter layers a group of their own, laid out after the indexer
+# regions and opted out of prefix caching. Inert without a drafter.
+COPY patches/glm53_dflash2_kv_groups.py /tmp/glm53_dflash2_kv_groups.py
+RUN python3 /tmp/glm53_dflash2_kv_groups.py && rm /tmp/glm53_dflash2_kv_groups.py
+
+# The fail-closed GLM tool parser, loaded with --tool-parser-plugin. Baked and
+# selected by the entrypoint rather than passed through EXTRA_ARGS: a compose
+# override that restated EXTRA_ARGS dropped it, twice, and production ran the
+# stock parser without anyone noticing.
+COPY patches/glm47_failclosed.py /usr/local/share/glm47_failclosed.py
+
+#   iproute2  the entrypoint finds this node's ConnectX address by scanning
+#             `ip -o -4 addr` for CLUSTER_SUBNET, and derives GLOO_SOCKET_IFNAME
+#             from whichever interface owns it; the port differs per box.
+#   ibverbs   NCCL's RoCE data plane. Missing, NCCL silently falls back to TCP
+#             over the LAN and every TP step crawls.
+#   ripgrep/pciutils/usbutils are for the MCP inventory and search tools.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 \
-        libibverbs1 librdmacm1 ibverbs-providers \
+        iproute2 libibverbs1 librdmacm1 ibverbs-providers \
         ripgrep pciutils usbutils \
     && rm -rf /var/lib/apt/lists/* \
-    && command -v ip && command -v rg \
-    && echo "runtime toolchain ok: ip + rg present"
+    && command -v ip && command -v rg
 
-# mentat replaces ray 2.57.0 (which is not a vLLM dependency -- this layer is
-# the single thing standing between this image and multi-node TP). Real Ray on
-# unified-memory GB10 caused two outages this swap exists to prevent: its
-# memory monitor killed healthy ranks at 95% node memory (the ~89 GiB of
-# weights ARE host memory), and its object store took up to ~36 GiB of the
-# pool for a model that moves every tensor over NCCL. mentat is a placement-
-# aware process launcher and nothing more, which is all vLLM's RayExecutorV2
-# actually uses Ray for.
-#
-# The shim reports ray.__version__ == 2.57.0 because vLLM version-checks it;
-# `ray.init` logs a mentat banner so nobody debugs believing it's real Ray.
-# The shim covers ONLY the audited V2-executor surface and raises
-# NotImplementedError on anything else -- on a vLLM base-image bump, re-audit
-# with:  grep -rn 'ray\.' <site-packages>/vllm/v1/executor/
-#
+# mentat replaces Ray. Unlike the single-GPU tenants, TP=4 across four boxes
+# really does need placement, so this installs the daemon binary and the `ray`
+# symlink as well as the shim package. Real Ray on unified memory caused two
+# outages this exists to prevent: its memory monitor killed healthy ranks at 95%
+# node memory (the ~89 GiB of weights ARE host memory), and its object store
+# took up to ~36 GiB for a model that moves every tensor over NCCL. On a vLLM
+# bump, re-audit the shim with: grep -rn 'ray\.' <site-packages>/vllm/v1/executor/
 COPY --from=mentat /out/ /tmp/mentat-out/
+# mentatd-probe-machine is how the agent learns this box's GPUs from 0.9.0 on
+# ("Move the machine inventory into a probe script"). Without it `ray start`
+# registers ZERO GPUs, and vLLM's placement dies with "required GPUs exceeds
+# the total number of available GPUs". It must sit beside mentatd or on PATH.
 RUN install -m755 /tmp/mentat-out/mentatd /usr/local/bin/mentatd \
+    && install -m755 /tmp/mentat-out/mentatd-probe-machine /usr/local/bin/mentatd-probe-machine \
     && ln -sf /usr/local/bin/mentatd /usr/local/bin/ray \
     && pip install --no-cache-dir --no-deps /tmp/mentat-out/mentatd-*-py3-none-any.whl \
     && rm -rf /tmp/mentat-out \
-    && ray --version | grep -q "mentat" \
-    && python3 -c "import ray, ray.cloudpickle; assert ray.__version__ == '2.57.0'"
+    && ray --version
 
 # py-spy reads another process's Python stack without stopping it -- the only
-# instrument that can see inside a scheduler tick that never returns. Needs
-# CAP_SYS_PTRACE at run time, granted in the compose file.
+# instrument that sees inside a scheduler tick that never returns.
 RUN pip install --no-cache-dir py-spy && py-spy --version
 
-# Assert the base is what this file assumes, so a moved tag fails the build
-# rather than producing an image that boots and cannot load the model.
-COPY patches/verify.py /tmp/verify.py
-RUN python3 /tmp/verify.py
+COPY verify-base.py /tmp/verify-base.py
+RUN python3 /tmp/verify-base.py && rm /tmp/verify-base.py
 
-
-# See entrypoint.sh: the checkpoint's own template refuses images outright.
 COPY chat-template.jinja /usr/local/share/glm53-chat-template.jinja
 COPY status-server.py self-test.py /usr/local/bin/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/local/bin/status-server.py /usr/local/bin/self-test.py /entrypoint.sh
 
-# 8002 = OpenAI API (deliberately NOT ds4-flash's 8001, so both can be
-#        configured on one node without a port clash even though only one can
-#        actually be resident)
-# 8082 = startup status page, bound from container start
+# 8002 = OpenAI API, 8082 = startup status page, bound from container start
 EXPOSE 8002 8082
 ENTRYPOINT ["/entrypoint.sh"]

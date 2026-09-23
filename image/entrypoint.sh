@@ -30,7 +30,7 @@ SERVED="${SERVED_NAME:-glm53}"
 # Copied wholesale from ds4-flash because the constraint is the hardware, not
 # the model. No literal address appears here or in the compose file: each node
 # finds its own cluster IP by looking for the interface carrying CLUSTER_SUBNET.
-# The boxes are NOT symmetric (a7c3 carries its link on enp1s0f1np1, the rest
+# The boxes are NOT symmetric (one carries its link on enp1s0f1np1, the rest
 # on enp1s0f0np0), so any hardcoded interface name is wrong somewhere whichever
 # you pick.
 #
@@ -131,8 +131,8 @@ fabric_port() {
 # There is no correct constant for the GID index. The table is keyed by
 # (address, RoCE version), slots are allocated first-free and freed in place, so
 # the index for one address differs per node AND per boot. Observed, not
-# theorised: on 2026-08-26 gx10-5818 held the right entry at 6 and gx10-2353 at
-# 5, because a `nmcli con delete` / `add` had left 5818 a hole at slot 3. Reboot
+# theorised: on 2026-08-26 one node held the right entry at 6 and its peer at
+# 5, because a `nmcli con delete` / `add` had left the first a hole at slot 3. Reboot
 # it with the static profile already in place and the table comes up dense,
 # moving that 6 to 5, at which point a pinned 6 names an empty slot and NCCL
 # fails every TP init with "unhandled system error".
@@ -279,11 +279,28 @@ export SHARED_TAG="${SHARED_TAG:-glm53-${_arch}-${_kv}}"
 # compose file warns about -- and it was live here: the cache tag said 131072
 # while the server was told 262144.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-_optstr="tp=${TP} mtp=${MTP} len=${MAX_MODEL_LEN} cg=${CUDAGRAPH_CAPTURE_SIZES}"
+_optstr="tp=${TP} mtp=${MTP} spec=${SPEC_METHOD:-} len=${MAX_MODEL_LEN} cg=${CUDAGRAPH_CAPTURE_SIZES}"
 _opthash=$(printf '%s' "$_optstr" | sha256sum | cut -c1-8)
 export CACHE_TAG="${CACHE_TAG:-${SHARED_TAG}-${_opthash}}"
 
-export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="${CACHE_ROOT}/${SHARED_TAG}/flashinfer_autotune"
+# FlashInfer autotune: EPHEMERAL on TP>1, and wiped on every start. A persisted
+# cache deadlocks the NEXT boot, silently and forever. On the nightly, rank 0
+# reads its cache and broadcasts it, but only rank 0 ever saves, and the fused-
+# MoE entries it saves key per rank: ranks 1-3 miss what rank 0 hits, go off to
+# profile (a CPU-group all_reduce) while rank 0 has moved on to the model's NCCL
+# all_reduce, and each waits for the other. Measured 2026-09-23 with py-spy on
+# spark-glm53:v3. The first boot always works (nobody has a cache); every boot
+# after a good one hangs with the head at 96% GPU and the workers at 0%.
+# Wiping on start, not just keeping it out of the bind mount, matters: a head
+# engine restart keeps the container's /tmp. Costs ~2 min of autotune a boot.
+# AUTOTUNE_CACHE=persist brings the old behaviour back (TP=1 is safe with it).
+if [[ "${AUTOTUNE_CACHE:-}" == "persist" || "${TP:-1}" -le 1 ]]; then
+  export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="${CACHE_ROOT}/${SHARED_TAG}/flashinfer_autotune"
+else
+  export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/flashinfer_autotune
+  rm -rf "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
+fi
+echo "autotune cache: $VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
 export VLLM_CACHE_ROOT="${CACHE_ROOT}/${CACHE_TAG}/vllm"
 mkdir -p "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" "$VLLM_CACHE_ROOT"
 
@@ -404,7 +421,13 @@ if [[ "$ROLE" == "worker" ]]; then
 fi
 
 # --- head -------------------------------------------------------------------
-ray start --head --node-ip-address="$VLLM_HOST_IP" --port=6379 \
+# --address names the daemon explicitly. mentat 0.7.0 refuses a bare --head
+# while RAY_ADDRESS is set ("--head names no daemon, so this agent would
+# register with the local one while RAY_ADDRESS names ..."): every agent of a
+# group and its driver must reach one daemon, and 0.6.0 let the two disagree
+# silently. On the head RAY_ADDRESS is its own daemon, so this changes nothing
+# about where it registers -- it only stops mentat having to guess.
+ray start --head --address="$RAY_ADDRESS" --node-ip-address="$VLLM_HOST_IP" --port=6379 \
           --object-store-memory="$RAY_OBJECT_STORE_MEMORY"
 
 # Starting the engine without its workers reaches NCCL and dies there
@@ -431,11 +454,26 @@ done
 # the base kernels run at all. The vendor recipe suggests k=5. Turn it on only
 # once the model serves without it, and judge it on acceptance LENGTH rather
 # than acceptance rate.
+#
+# SPEC_METHOD picks the drafter: mtp (the checkpoint's own head) or dflash (the
+# separate DFlash2 draft model at DFLASH_MODEL, which must be mounted; k must be
+# 7, its block size minus one, and the model refuses anything else). Unset, it
+# follows MTP=1 as before. Set here rather than through EXTRA_ARGS, which is one
+# string that a compose override restating it silently replaces.
+SPEC_METHOD="${SPEC_METHOD:-}"
+[[ -z "$SPEC_METHOD" && "$MTP" == "1" ]] && SPEC_METHOD=mtp
 SPEC=()
-if [[ "$MTP" == "1" ]]; then
-  SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${SPEC_TOKENS:-4}}")
-  echo "speculative: ${SPEC[*]}"
-fi
+case "$SPEC_METHOD" in
+  mtp)
+    SPEC_TOKENS="${SPEC_TOKENS:-4}"
+    SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${SPEC_TOKENS}}") ;;
+  dflash)
+    SPEC_TOKENS="${SPEC_TOKENS:-7}"
+    SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"${DFLASH_MODEL:-/models/glm-5.3-flash-dflash2}\",\"num_speculative_tokens\":${SPEC_TOKENS}}") ;;
+  ""|none) ;;
+  *) echo "FATAL: SPEC_METHOD=$SPEC_METHOD; want mtp, dflash or none" >&2; exit 1 ;;
+esac
+[[ ${#SPEC[@]} -gt 0 ]] && echo "speculative: ${SPEC[*]}"
 
 stage loading
 
@@ -459,6 +497,29 @@ else
     done ) &
 fi
 
+# --- tool parser --------------------------------------------------------------
+# glm47_failclosed by default: a plugin baked at /usr/local/share, loaded with
+# --tool-parser-plugin. It used to arrive through EXTRA_ARGS from a compose
+# override, and kv-26gib-override.yaml restated EXTRA_ARGS after it -- compose
+# keeps the last value -- so production ran the stock glm47 parser. Selected
+# here, it cannot be dropped by an override. TOOL_PARSER=glm47 is the stock one.
+TOOL_PARSER="${TOOL_PARSER:-glm47_failclosed}"
+TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+if [[ "$TOOL_PARSER" == "glm47_failclosed" ]]; then
+  TOOL_ARGS=(--tool-parser-plugin /usr/local/share/glm47_failclosed.py "${TOOL_ARGS[@]}")
+fi
+echo "tool parser: $TOOL_PARSER"
+
+# --- sparse indexer top-k -------------------------------------------------------
+# GB10 cannot run persistent_topk once the KV pool passes ~3.4M tokens (it would
+# oversubscribe 48 CTAs), and the FilteredTopK fallback wants 128 KB of shared
+# memory per block against the 101,376 B an SM has. per_row is the same
+# computation without the persistent-CTA scheme. This used to be a patch
+# (gb10_topk_fallback.py); on main it is a flag. "auto" tries cooperative,
+# then persistent, then per_row.
+TOPK_BACKEND="${TOPK_BACKEND:-per_row}"
+TOPK_ARGS=(--sparse-indexer-topk-backend "$TOPK_BACKEND")
+
 # --load-format auto, NOT sharded_state -- see the header.
 #
 # Parser names do not match the model version, which is normal here: the vendor
@@ -480,9 +541,7 @@ MOE=()
 if [[ "${MOE_BACKEND:-marlin}" == "marlin" ]]; then
   if [[ "${CUDA_GRAPHS:-1}" == "1" ]]; then
     _k=1
-    [[ "$MTP" == "1" ]] && _k=$(( ${SPEC_TOKENS:-4} + 1 ))
-    [[ "$EXTRA_ARGS" == *'"method":"dflash"'* ]] &&
-      _k=$(( $(sed 's/.*"method":"dflash".*"num_speculative_tokens":\([0-9]*\).*/\1/' <<<"$EXTRA_ARGS") + 1 ))
+    [[ -n "$SPEC_METHOD" && "$SPEC_METHOD" != none ]] && _k=$(( SPEC_TOKENS + 1 ))
     _ceil=$(( ${MAX_NUM_SEQS:-8} * _k ))
     _largest=$(tr ' ' '\n' <<<"$CUDAGRAPH_CAPTURE_SIZES" | sort -n | tail -1)
     if (( _largest > _ceil )); then
@@ -592,7 +651,8 @@ exec vllm serve "$MODEL" \
   "${MM[@]}" \
   "${TMPL[@]}" \
   ${ITERATION_DETAILS:+--enable-logging-iteration-details} \
-  --enable-auto-tool-choice --tool-call-parser glm47 \
+  "${TOOL_ARGS[@]}" \
+  "${TOPK_ARGS[@]}" \
   --reasoning-parser glm45 \
   "${SPEC[@]}" \
   --host 0.0.0.0 --port "${API_PORT:-8002}" \

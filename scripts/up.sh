@@ -7,7 +7,7 @@ HEAD=${1:?usage: up.sh <head-ip> <worker-ip>...}
 shift
 NODES=("$HEAD" "$@")
 COMPOSE_DIR=${COMPOSE_DIR:-compose/glm53}
-FILES="-f glm53.yaml -f pp-mtp-override.yaml -f dflash2-full-override.yaml -f spin-wait-override.yaml"
+FILES="-f glm53.yaml -f dflash2.yaml"
 
 echo "== mentatd (Ray replacement) on every node =="
 for n in "${NODES[@]}"; do
