@@ -1,31 +1,32 @@
-# mentatd: the host-level mentat daemon, one per GB10 box. Deploy to
-# ~/compose/mentatd/ on each node with a per-node .env:
+# mentatd: the host-level mentat daemon that replaces Ray, one per GX10. Based
+# on mentatd.yaml from https://github.com/mmastrac/mentat at v0.12.0; its
+# GUIDE.md "Environment" has every variable.
 #
-#   gx10-n1 (.env): MENTAT_NODE_IP=10.100.0.2
-#                     MENTAT_PEERS=10.100.0.1:6379,192.0.2.13:6379
-#   gx10-n2 (.env): MENTAT_NODE_IP=10.100.0.1
-#                     MENTAT_PEERS=10.100.0.2:6379,192.0.2.13:6379
-#   gx10-n3 (.env): MENTAT_NODE_IP=192.0.2.13
-#                     MENTAT_PEERS=192.0.2.11:6379,192.0.2.12:6379
+#   docker compose -f compose/mentatd.yaml up -d
 #
-# MENTAT_NODE_IP is this node's CLUSTER identity -- on the serving pair that
-# is the ConnectX 10.100.0.x address (matching VLLM_HOST_IP inside the model
-# containers), NOT the LAN address. Left empty the daemon derives its identity
-# from the default route, which lands on the LAN address and breaks the
-# driver-node match on the pair. n3 has no QSFP link, so its LAN address IS
-# its cluster identity, and it must dial the pair by their LAN addresses --
-# the mesh dedupes by node id, not by the address a link happened to use.
+# It reads the same compose/.env as glm53.yaml, so a node needs no second
+# file. By default it takes its identity from VLLM_HOST_IP and dials the head
+# at HEAD_HOST:6379.
 #
-# Must be running before any converted model container starts: the containers'
-# `ray start` registers with this daemon on 127.0.0.1:6379 (retrying, so
-# ordering only delays them, never kills them).
+# Start it on every node before, or with, the model: a model container
+# registers with this daemon on 127.0.0.1:6379 and retries until it answers.
+#
+# The version must match the shim baked into the image (MENTAT_VERSION in
+# image/Dockerfile): a 0.12.0 shim cannot join an older daemon.
+#
+# Pinned so the project is not named after this directory ("compose"), which
+# glm53.yaml and mentatd-serve.yaml share.
+name: mentatd
 services:
   mentatd:
-    image: ${IMAGE:-mmastrac/mentatd:0.12.0}
+    # Registry-qualified on purpose: a bare `mentatd:<ver>` resolves to a local
+    # image first, and a mislabelled local tag once ran 0.1.0 under a 0.4.0
+    # name. Check with `docker exec mentatd mentatd --version`.
+    image: ${MENTATD_IMAGE:-mmastrac/mentatd:0.12.0}
     container_name: mentatd
-    # Host networking on purpose: the control port must be reachable both at
-    # 127.0.0.1:6379 (agents in host-network model containers) and on the
-    # cluster subnets (the worker's agent and the mesh).
+    # The control port must listen on 127.0.0.1:6379 for the agents in
+    # host-network model containers, and on the node's own addresses for the
+    # other daemons.
     network_mode: host
     restart: unless-stopped
     # The HMAC key when it lives in a file. Point MENTAT_SECRET_HOST_FILE at
@@ -34,11 +35,17 @@ services:
     volumes:
       - ${MENTAT_SECRET_HOST_FILE:-/dev/null}:/run/mentat/secret:ro
     environment:
-      - MENTAT_NODE_IP=${MENTAT_NODE_IP:-}
-      - MENTAT_PEERS=${MENTAT_PEERS:-}
-      # Lifecycle tuning, all optional, in milliseconds. Defaults in README
-      # "Tuning" and rust/src/config.rs. Set in the per-node .env only when
-      # deviating from the defaults.
+      # This node's cluster identity. It must be the same address the model
+      # container uses (VLLM_HOST_IP), or placement cannot see that the
+      # container's GPUs are on this node. The daemon's own default is the
+      # default route's source address, which is the wrong link on a
+      # multi-homed box.
+      - MENTAT_NODE_IP=${MENTAT_NODE_IP:-${VLLM_HOST_IP:?set VLLM_HOST_IP to this node's LAN address in .env}}
+      # One address that reaches any live daemon is enough; the rest of the
+      # mesh is learned from it, and an entry naming this daemon is skipped.
+      # Use LAN addresses: a fabric address moves when cables move.
+      - MENTAT_PEERS=${MENTAT_PEERS:-${HEAD_HOST:?set HEAD_HOST to the head node's address in .env}:6379}
+      # Lifecycle tuning, in milliseconds. Empty uses the default.
       - MENTAT_PG_PENDING_TIMEOUT_MS=${MENTAT_PG_PENDING_TIMEOUT_MS:-}
       - MENTAT_AGENT_DEGRADED_AFTER_MS=${MENTAT_AGENT_DEGRADED_AFTER_MS:-}
       - MENTAT_AGENT_DEAD_AFTER_MS=${MENTAT_AGENT_DEAD_AFTER_MS:-}
@@ -47,23 +54,46 @@ services:
       - MENTAT_ELECTION_HOLD_DOWN_MS=${MENTAT_ELECTION_HOLD_DOWN_MS:-}
       - MENTAT_PEER_STATUS_INTERVAL_MS=${MENTAT_PEER_STATUS_INTERVAL_MS:-}
       - MENTAT_SLOW_CALL_WARN_MS=${MENTAT_SLOW_CALL_WARN_MS:-}
+      - MENTAT_HISTORY_KEEP_MS=${MENTAT_HISTORY_KEEP_MS:-}
       - MENTAT_SESSION_REAP_GRACE_MS=${MENTAT_SESSION_REAP_GRACE_MS:-}
       - MENTAT_TCP_DEAD_AFTER_MS=${MENTAT_TCP_DEAD_AFTER_MS:-}
-      # UDP self-announcement for mentatd-serve discovery. Empty = broadcast
-      # on port 6382 every 5s; 0 disables. MENTAT_ANNOUNCE_ADDR adds
-      # unicast targets for a listener outside every broadcast domain.
+      # UDP self-announcement, which is how mentatd-serve finds the daemons.
+      # Empty = broadcast on port 6382 every 5 s; 0 turns it off.
+      # MENTAT_ANNOUNCE_ADDR adds unicast targets for a listener outside
+      # every broadcast domain.
       - MENTAT_ANNOUNCE_PORT=${MENTAT_ANNOUNCE_PORT:-}
       - MENTAT_ANNOUNCE_ADDR=${MENTAT_ANNOUNCE_ADDR:-}
-      # Interfaces to announce on. Empty picks every up non-loopback
-      # interface except the container bridges.
+      # Interfaces to announce on, preferred first, with optional tags. Empty
+      # picks every up non-loopback interface except container bridges,
+      # untagged. Names are `*`/`?` patterns, case-sensitive and exact, so one
+      # line serves every node. On a GX10, for example:
+      #
+      #   MENTAT_ANNOUNCE_IFACES=enP7s7=lan,enp1s0f*np*=connectx+rdma
+      #
+      # The LAN goes first because the order is the router's preference, and
+      # for HTTP to the API reachable beats fast. The `rdma` tag makes mentat
+      # place the four ranks inside one probed fabric. A group is held to that
+      # as soon as any node carries the tag, so a tag on a link whose probes
+      # fail leaves the model waiting in placement, with nothing in the
+      # container log, until MENTAT_PG_PENDING_TIMEOUT_MS (10 min).
       - MENTAT_ANNOUNCE_IFACES=${MENTAT_ANNOUNCE_IFACES:-}
+      # Addresses to announce instead of deriving them from interfaces, same
+      # syntax. For a node whose advertisable address is on none of its own
+      # interfaces.
+      - MENTAT_ANNOUNCE_ADDRS=${MENTAT_ANNOUNCE_ADDRS:-}
+      # Reachability probing and the fabric-island hold-down. Empty uses the
+      # defaults (15 s interval, 2 s per probe, 5 s hold-down).
+      - MENTAT_PROBE_INTERVAL_MS=${MENTAT_PROBE_INTERVAL_MS:-}
+      - MENTAT_PROBE_TIMEOUT_MS=${MENTAT_PROBE_TIMEOUT_MS:-}
+      - MENTAT_ISLAND_HOLD_DOWN_MS=${MENTAT_ISLAND_HOLD_DOWN_MS:-}
+      # `off` places multi-bundle groups without the one-fabric constraint,
+      # for a cluster whose probes disagree with its cabling.
       - MENTAT_ISLAND_PLACEMENT=${MENTAT_ISLAND_PLACEMENT:-}
-      # HMAC key for announcements, matching spark-agent's mesh discovery.
-      # Unset leaves them unsigned. A file keeps the key out of the
-      # environment.
+      # HMAC key for announcements. Unset leaves them unsigned. A file keeps
+      # the key out of the environment.
       - MENTAT_SECRET=${MENTAT_SECRET:-}
-      # Set this to /run/mentat/secret to use the mount above. A path
-      # that reads empty turns signing off, even with MENTAT_SECRET set.
+      # Set this to /run/mentat/secret to use the mount above. A file that
+      # cannot be read, or reads empty, stops the daemon at boot.
       - MENTAT_SECRET_FILE=${MENTAT_SECRET_FILE:-}
       # Cluster name. Foreign universes are dropped without a log line.
       - MENTAT_UNIVERSE=${MENTAT_UNIVERSE:-}
