@@ -23,6 +23,7 @@
 #     glm53_mtp_bf16.py             MTP layer is BF16 but config.json says NVFP4
 #     sm90_fp8_kv_dtype.py          SM90 builder planned fp8 KV as uint8
 #     glm53_reasoning_always_parsed.py  thinking off = low effort, still <think>
+#     glm53_kpool_tail_ring.py      tail ring sized for spec decode (vllm#55219 part)
 #   kept:
 #     glm53-flash_SM121.py (MiaAI)  6 of 7 edits apply unchanged; see below
 #     gb10_plugin_backend.py        MiaAI vs LibertAI sparse-MLA switch
@@ -41,7 +42,8 @@ ARG BASE=vllm/vllm-openai:nightly-0961bbae2894d574be790d219651824eb199318e
 # Pulled registry-qualified: a bare `mentat-artifacts:<ver>` tag resolves to a
 # local image, and those have been mislabelled before -- every image "pinned"
 # to 0.4.0 once silently ran 0.1.0. Verify with `mentatd --version`.
-# 0.7.0 matches the host daemons, and adopts actors across a daemon restart.
+# Must match the host daemons (mentatd and mentatd-serve): 0.12.0 speaks
+# protocol 0.99, and a shim from 0.8 or older cannot join them.
 ARG MENTAT_VERSION=0.12.0
 
 FROM mmastrac/mentat-artifacts:${MENTAT_VERSION} AS mentat
@@ -117,6 +119,14 @@ RUN python3 /tmp/glm53_mtp_bf16.py && rm /tmp/glm53_mtp_bf16.py
 COPY image/patches/glm53_reasoning_always_parsed.py /tmp/glm53_reasoning_always_parsed.py
 RUN python3 /tmp/glm53_reasoning_always_parsed.py && rm /tmp/glm53_reasoning_always_parsed.py
 
+# The kpool tail ring held exactly index_kpool (4) slots, but a spec-verify step
+# stashes 1 + num_spec rows (4 with MTP, 8 with DFlash2) before acceptance: a
+# rejected pool-completing draft let the drafts behind it overwrite that pool's
+# committed keys, and the redo wrote a wrong indexer key for good. The ring now
+# covers a spec step. Upstream fix pending (the ring part of vllm#55219).
+COPY image/patches/glm53_kpool_tail_ring.py /tmp/glm53_kpool_tail_ring.py
+RUN python3 /tmp/glm53_kpool_tail_ring.py && rm /tmp/glm53_kpool_tail_ring.py
+
 # DFlash2's drafter adds five sliding-window attention layers, and the nightly's
 # GLM-5-Next KV grouper gives up on any spec that is not MLA, so the model falls
 # onto the generic path and dies in unify_kv_cache_spec_page_size ("page size is
@@ -162,10 +172,6 @@ RUN install -m755 /tmp/mentat-out/mentatd /usr/local/bin/mentatd \
     && pip install --no-cache-dir --no-deps /tmp/mentat-out/mentatd-*-py3-none-any.whl \
     && rm -rf /tmp/mentat-out \
     && ray --version
-
-# py-spy reads another process's Python stack without stopping it -- the only
-# instrument that sees inside a scheduler tick that never returns.
-RUN pip install --no-cache-dir py-spy && py-spy --version
 
 COPY image/verify-base.py /tmp/verify-base.py
 RUN python3 /tmp/verify-base.py && rm /tmp/verify-base.py
