@@ -38,7 +38,10 @@ nvidia/GLM-5.3-Flash-NVFP4, both ConnectX-7 PCIe roots in use:
   - [nvidia/GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4),
     181 GiB, at `MODEL_HOST_DIR`
   - [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2),
-    the drafter, 2.2 GiB, at `DFLASH_HOST_DIR`
+    the drafter, 2.2 GiB, at `DFLASH_HOST_DIR`. It is licensed CC BY-NC-ND
+    4.0, non-commercial; check that before you serve it. `SPEC_METHOD=mtp`
+    uses the checkpoint's own MTP head instead, slower but with no second
+    download.
 
   `hf download` is resumable.
 - **Docker with the NVIDIA container runtime and Compose v2** on every box,
