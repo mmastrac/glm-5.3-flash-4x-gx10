@@ -33,7 +33,7 @@ OLD = """        config = vllm_config.speculative_config.draft_model_config.hf_c
 NEW = """        config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
-        # GLM53-MTP-BF16: see patches/glm53_mtp_bf16.py in spark-glm53.
+        # GLM53-MTP-BF16: see image/patches/glm53_mtp_bf16.py in glm-5.3-flash-4x-gx10.
         if quant_config is not None and _glm53_mtp_layer_unquantized(
             vllm_config.speculative_config.draft_model_config.model, prefix
         ):

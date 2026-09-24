@@ -19,9 +19,22 @@ set -euo pipefail
 # ds4-flash/vllm-spark.patch.
 # ---------------------------------------------------------------------------
 
-TP="${TP:-2}"
+TP="${TP:-4}"
 MTP="${MTP:-1}"
-RANK="${NODE_RANK:-0}"
+# SPEC_METHOD picks the drafter: dflash (the separate DFlash2 draft model at
+# DFLASH_MODEL, which must be mounted on every node; k must be 7, its block
+# size minus one, and the model refuses anything else), mtp (the checkpoint's
+# own head, num_nextn_predict_layers: 1), or none. MTP=0 is the older off
+# switch and still turns speculation off whichever method is named. Resolved
+# here, above the cache tag, because the tag hashes it.
+#
+# dflash is what serves: 109.8 / 88.8 / 52.6 tok/s on structured / code / prose
+# with v6, where MTP gave 57.2 / 54.4 / 45.6 with v4 (both 2026-09-23). Judge a drafter
+# on acceptance LENGTH, not acceptance rate. Set here rather than through
+# EXTRA_ARGS, which is one string that a compose override restating it
+# silently replaces.
+SPEC_METHOD="${SPEC_METHOD:-dflash}"
+[[ "$MTP" == "0" ]] && SPEC_METHOD=none
 ROLE="${ROLE:-head}"
 MODEL="${MODEL_DIR:-/models/glm-5.3-flash-nvfp4}"
 SERVED="${SERVED_NAME:-glm53}"
@@ -37,7 +50,7 @@ SERVED="${SERVED_NAME:-glm53}"
 # An uncabled port powers down completely -- no PCI device, no
 # /sys/class/infiniband entry. That is not a missing driver and no amount of
 # modprobe fixes it, so a node reports only the ports it actually has.
-CLUSTER_SUBNET="${CLUSTER_SUBNET:-10.100.0.}"
+CLUSTER_SUBNET="${CLUSTER_SUBNET:?set CLUSTER_SUBNET to the fabric address prefix, with its trailing dot}"
 _cxip=$(ip -o -4 addr show 2>/dev/null | awk -v p="$CLUSTER_SUBNET" \
         '$4 ~ "^"p {split($4,a,"/"); print a[1]; exit}')
 
@@ -180,7 +193,29 @@ export NCCL_IB_HCA NCCL_IB_GID_INDEX
 # remote peer spark-head".
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$GLOO_SOCKET_IFNAME}"
 
-RAY_ADDRESS="${RAY_ADDRESS:-${HEAD_HOST:-spark-head}:6379}"
+# Channel count. NCCL picks 64 here, while every published GB10 recipe pins
+# 4-12. 8 was chosen on 2026-09-06 while the fabric was stuck at 12 Gb/s, before
+# a power drain fixed it; NCCL's own choice has not been re-tested since.
+export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+# INFO prints the devices NCCL actually selected, which is the only way to
+# confirm both roots are in use.
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+
+# --- worker memory ---------------------------------------------------------
+# Torch's caching allocator never hands a freed block back to the OS, and on
+# unified memory that block is host memory. The sparse indexer scores
+# chunk x context/kpool, so a session whose context keeps growing asks for a
+# slightly bigger block each step and strands the last one.
+# expandable_segments:True grows one segment instead of laddering.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Hard ceiling on one worker's device memory, as a fraction of the 121.6 GiB,
+# read by spark_mem_trace.py. Keep it above GPU_MEM_UTIL by enough for a full
+# prefill's indexer scratch, and below 1.0 by whatever the host needs to keep
+# forking: past this a request raises OutOfMemoryError instead of the node
+# wedging. 0.92 is ~111.9 GiB against GPU_MEM_UTIL's ~107.
+export TORCH_MEM_FRACTION="${TORCH_MEM_FRACTION:-0.92}"
+
+RAY_ADDRESS="${RAY_ADDRESS:-${HEAD_HOST:?set HEAD_HOST to the head node address}:6379}"
 export RAY_ADDRESS
 
 # mentat (the Ray replacement in this image) rendezvouses subclusters by
@@ -202,10 +237,12 @@ export VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
 # admissions from the waiting queue. Measured on DS4 2026-08-25: a 90-token
 # "ping" sent 20s into a 198K-token prefill took 125.5s to answer.
 #
-# Expressed as the RESERVE because that is the number with meaning. Carried over
-# from DS4 unmeasured for GLM: step cost here is not yet known, so treat 2048/256
-# as a starting point and re-derive from TUNING.md once it serves.
-export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+# 16384 with each prefill capped at 2304, so one step carries several prefill
+# chunks and every running decode. Measured on TP=4 (2026-09-06): 8192 and
+# 16384 prefill a 200k prompt in the same time (234.1 s against 237.7 s); the
+# old 9.5x win for 8192 was a PP=2 pipeline bubble, gone at PP=1. Measure this
+# at 200k, never at 8k: an 8k prompt fits inside both budgets.
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
 
 # --- max_num_seqs is capped by the KDA state, not by throughput -------------
 # 34 of this model's 45 layers are KDA linear attention, and a linear-attention
@@ -222,21 +259,27 @@ export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 #   cannot proceed.
 #
 # This is a hard structural cap, not a tuning preference -- raising
-# GPU_MEM_UTIL is the only way to buy more blocks, and 0.86 is already DS4's
-# measured ceiling on these boxes. 32 concurrent sequences is ample here.
+# GPU_MEM_UTIL is the only way to buy more blocks. The default takes all 32.
 #
 # Keep CUDAGRAPH_CAPTURE_SIZES's largest entry >= this value: with MTP off a
 # decode step is one token per sequence, so a full batch is exactly this many
 # tokens, and a step larger than the biggest captured size runs uncaptured.
-export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-DECODE_RESERVE_TOKENS="${DECODE_RESERVE_TOKENS:-256}"
-_thr=$(( (MAX_NUM_BATCHED_TOKENS - DECODE_RESERVE_TOKENS) / 4 * 4 ))
-if (( _thr < 4 )); then
-  echo "FATAL: DECODE_RESERVE_TOKENS=${DECODE_RESERVE_TOKENS} leaves only ${_thr}" >&2
-  echo "tokens for prefill out of a ${MAX_NUM_BATCHED_TOKENS} budget." >&2
-  exit 1
+export MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+
+# One prefill's share of the step: 2304, one KDA block. A multiple of the block
+# matters -- 2048 produced alternating 2048/256 chunks. With it (2026-09-06),
+# prefill ran 2,004 tok/s at 200k and a 12-token ping sent under a 120k prefill
+# answered in 4.83 s. DECODE_RESERVE_TOKENS, when set, replaces it with
+# budget minus reserve, which is how DS4 expresses the same split.
+LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-2304}"
+if [[ -n "${DECODE_RESERVE_TOKENS:-}" ]]; then
+  LONG_PREFILL_TOKEN_THRESHOLD=$(( (MAX_NUM_BATCHED_TOKENS - DECODE_RESERVE_TOKENS) / 4 * 4 ))
+  if (( LONG_PREFILL_TOKEN_THRESHOLD < 4 )); then
+    echo "FATAL: DECODE_RESERVE_TOKENS=${DECODE_RESERVE_TOKENS} leaves only" >&2
+    echo "${LONG_PREFILL_TOKEN_THRESHOLD} tokens for prefill out of a ${MAX_NUM_BATCHED_TOKENS} budget." >&2
+    exit 1
+  fi
 fi
-LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-$_thr}"
 CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-8 16 32 64 96 128 192 256}"
 echo "scheduler: budget=${MAX_NUM_BATCHED_TOKENS} prefill<=${LONG_PREFILL_TOKEN_THRESHOLD}" \
      "reserve=$(( MAX_NUM_BATCHED_TOKENS - LONG_PREFILL_TOKEN_THRESHOLD ))/step"
@@ -274,12 +317,16 @@ _arch="${_arch:-unknown}"
 # on bf16, so do not switch on the assumption that it is the safer default.
 _kv="${KV_CACHE_DTYPE:-fp8_e4m3}"
 export SHARED_TAG="${SHARED_TAG:-glm53-${_arch}-${_kv}}"
-# Resolve ONCE, above every use. Two `${MAX_MODEL_LEN:-...}` defaults in one
+# Resolve ONCE, above every use. Two MAX_MODEL_LEN defaults in one
 # file is the "two places to change and one silently winning" trap the DS4
 # compose file warns about -- and it was live here: the cache tag said 131072
 # while the server was told 262144.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-_optstr="tp=${TP} mtp=${MTP} spec=${SPEC_METHOD:-} len=${MAX_MODEL_LEN} cg=${CUDAGRAPH_CAPTURE_SIZES}"
+#
+# 524288 of the model's 1M. KV is cheap here -- only 11 of 45 layers carry one,
+# at kv_lora_rank 512 -- so the 26 GiB pin below holds 2,632,595 tokens with
+# DFlash2, 5.02 requests at full length (head boot log, 2026-09-23).
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
+_optstr="tp=${TP} mtp=${MTP} spec=${SPEC_METHOD} len=${MAX_MODEL_LEN} cg=${CUDAGRAPH_CAPTURE_SIZES}"
 _opthash=$(printf '%s' "$_optstr" | sha256sum | cut -c1-8)
 export CACHE_TAG="${CACHE_TAG:-${SHARED_TAG}-${_opthash}}"
 
@@ -394,11 +441,15 @@ export RAY_memory_monitor_refresh_ms="${RAY_MEMORY_MONITOR_REFRESH_MS:-0}"
 # at a port with nothing behind it. The provider names the engine behind that
 # endpoint, which two servers answering /v1/chat/completions do not reveal by
 # answering it, so it goes on the rank that announces the endpoint.
-export MENTAT_MCP_API="${MENTAT_MCP_API:-http://${VLLM_HOST_IP}:${STATUS_PORT:-8082}/mcp}"
+#
+# Port form (8002/v1): the router resolves it against every address the node
+# announces, so a router on the LAN and one on the fabric both reach it. A URL
+# pins one address, reachable only from that link. Both servers bind 0.0.0.0.
+export MENTAT_MCP_API="${MENTAT_MCP_API:-${STATUS_PORT:-8082}/mcp}"
 if [[ "$ROLE" == "worker" ]]; then
   unset MENTAT_OPENAI_API
 else
-  export MENTAT_OPENAI_API="${MENTAT_OPENAI_API:-http://${VLLM_HOST_IP}:${API_PORT:-8002}/v1}"
+  export MENTAT_OPENAI_API="${MENTAT_OPENAI_API:-${API_PORT:-8002}/v1}"
   export MENTAT_MODEL_PROVIDER="${MENTAT_MODEL_PROVIDER:-vllm}"
 fi
 
@@ -448,29 +499,23 @@ while :; do
   _waited=$(( _waited + 5 ))
 done
 
-# GLM-5.3-Flash carries an MTP head (num_nextn_predict_layers: 1). OFF by
-# default here: it is another moving part on an architecture nothing has served
-# on this hardware before, and the point of the first boot is to find out whether
-# the base kernels run at all. The vendor recipe suggests k=5. Turn it on only
-# once the model serves without it, and judge it on acceptance LENGTH rather
-# than acceptance rate.
-#
-# SPEC_METHOD picks the drafter: mtp (the checkpoint's own head) or dflash (the
-# separate DFlash2 draft model at DFLASH_MODEL, which must be mounted; k must be
-# 7, its block size minus one, and the model refuses anything else). Unset, it
-# follows MTP=1 as before. Set here rather than through EXTRA_ARGS, which is one
-# string that a compose override restating it silently replaces.
-SPEC_METHOD="${SPEC_METHOD:-}"
-[[ -z "$SPEC_METHOD" && "$MTP" == "1" ]] && SPEC_METHOD=mtp
+# The drafter was chosen at the top (SPEC_METHOD). A missing drafter would
+# otherwise fail only after the ~10 minute target load, so check it first.
 SPEC=()
 case "$SPEC_METHOD" in
+  dflash)
+    SPEC_TOKENS="${SPEC_TOKENS:-7}"
+    DFLASH_MODEL="${DFLASH_MODEL:-/models/glm-5.3-flash-dflash2}"
+    if [[ ! -f "$DFLASH_MODEL/config.json" ]]; then
+      echo "FATAL: SPEC_METHOD=dflash but no config.json under DFLASH_MODEL=$DFLASH_MODEL." >&2
+      echo "Mount the DFlash2 drafter there on every node, or set SPEC_METHOD=mtp." >&2
+      exit 1
+    fi
+    SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"${DFLASH_MODEL}\",\"num_speculative_tokens\":${SPEC_TOKENS}}") ;;
   mtp)
     SPEC_TOKENS="${SPEC_TOKENS:-4}"
     SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${SPEC_TOKENS}}") ;;
-  dflash)
-    SPEC_TOKENS="${SPEC_TOKENS:-7}"
-    SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"${DFLASH_MODEL:-/models/glm-5.3-flash-dflash2}\",\"num_speculative_tokens\":${SPEC_TOKENS}}") ;;
-  ""|none) ;;
+  none) ;;
   *) echo "FATAL: SPEC_METHOD=$SPEC_METHOD; want mtp, dflash or none" >&2; exit 1 ;;
 esac
 [[ ${#SPEC[@]} -gt 0 ]] && echo "speculative: ${SPEC[*]}"
@@ -525,8 +570,20 @@ TOPK_ARGS=(--sparse-indexer-topk-backend "$TOPK_BACKEND")
 # Parser names do not match the model version, which is normal here: the vendor
 # recipe for 5.3-Flash specifies glm47 and glm45.
 # --- MoE backend and CUDA graphs -------------------------------------------
-# marlin because the native NVFP4 MoE kernels die on sm_121 with
-# cudaErrorNoKernelImageForDevice; marlin dequantises to FP16 instead.
+# flashinfer_cutlass, the native NVFP4 kernel, which runs W4A4 off the
+# checkpoint's per-projection input scales. Production has served on it with
+# the nvidia checkpoint since 2026-09-21; why it replaced marlin then is not
+# recorded. It decodes 109.8 / 88.8 / 52.6 tok/s (structured / code / prose,
+# v6 + DFlash2, 2026-09-23) and passes the thinking-on count-to-200 probe 8/8.
+# It takes vLLM's own CUDA graph sizes; CUDAGRAPH_CAPTURE_SIZES applies to
+# marlin only.
+#
+# marlin was the default before that. It is weight-only: it dequantises to FP16
+# and runs bf16 activations, so a checkpoint's input scales are never read. It
+# was adopted when the native kernels died on sm_121 with
+# cudaErrorNoKernelImageForDevice, a failure both MiaAI-Lab and LibertAI later
+# put down to one checkpoint's uninitialised input_scale. It is also not
+# bit-deterministic at M >> 1.
 #
 # Pairing marlin with --enforce-eager is recipe convention, not a correctness
 # constraint. Marlin's workspace helper reuses storage precisely so a captured
@@ -538,11 +595,12 @@ TOPK_ARGS=(--sparse-indexer-topk-backend "$TOPK_BACKEND")
 # falls back to eager with nothing in the log to say so, which is why the
 # ceiling is computed and checked rather than left to whoever edits the list.
 MOE=()
-if [[ "${MOE_BACKEND:-marlin}" == "marlin" ]]; then
+MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
+if [[ "$MOE_BACKEND" == "marlin" ]]; then
   if [[ "${CUDA_GRAPHS:-1}" == "1" ]]; then
     _k=1
     [[ -n "$SPEC_METHOD" && "$SPEC_METHOD" != none ]] && _k=$(( SPEC_TOKENS + 1 ))
-    _ceil=$(( ${MAX_NUM_SEQS:-8} * _k ))
+    _ceil=$(( MAX_NUM_SEQS * _k ))
     _largest=$(tr ' ' '\n' <<<"$CUDAGRAPH_CAPTURE_SIZES" | sort -n | tail -1)
     if (( _largest > _ceil )); then
       echo "WARNING: largest capture size $_largest exceeds max_num_seqs*(1+k)=$_ceil;" >&2
@@ -559,20 +617,25 @@ if [[ "${MOE_BACKEND:-marlin}" == "marlin" ]]; then
   fi
 else
   MOE=(--moe-backend "${MOE_BACKEND}")
-  echo "MoE backend: ${MOE_BACKEND} (expect cudaErrorNoKernelImageForDevice if native)"
+  echo "MoE backend: ${MOE_BACKEND} (vLLM's own CUDA graph sizes)"
 fi
 
-# Multimodal. --skip-mm-profiling keeps image+video serving without the
-# max-size dummy forward at init, which is slow and can OOM on UMA.
-# The closing brace is escaped: bash ends ${VAR:-...} at the first unescaped
+# Multimodal: up to 16 images a prompt, no video. Exceeding a cap is a clean
+# 400 with an OpenAI-shaped error body, not an engine fault, but a client that
+# treats any 400 as fatal dies on it.
+# The closing brace is escaped: bash ends a :- default at the first unescaped
 # one, so it would cut the default short and append the tail as literal text.
-LIMIT_MM="${LIMIT_MM:-{\"image\":4,\"video\":1\}}"
+LIMIT_MM="${LIMIT_MM:-{\"image\":16,\"video\":0\}}"
 python3 -c 'import json, sys; json.loads(sys.argv[1])' "$LIMIT_MM" 2>/dev/null || {
   echo "FATAL: LIMIT_MM is not valid JSON: $LIMIT_MM" >&2
   echo "       Write the whole object, closing brace included." >&2
   exit 1; }
 MM=(--limit-mm-per-prompt "$LIMIT_MM")
-[[ "${SKIP_MM_PROFILING:-1}" == "1" ]] && MM+=(--skip-mm-profiling)
+# 0: run the max-size dummy forward at init, so the vision encoder's peak is
+# budgeted at startup instead of coming out of the headroom a long prefill
+# needs at run time. 1 skips it, which is faster to boot and was the default
+# while images were capped at 4.
+[[ "${SKIP_MM_PROFILING:-0}" == "1" ]] && MM+=(--skip-mm-profiling)
 
 # The checkpoint ships a TEXT-ONLY template. Its media branch renders
 # "<reminder>You are unable to process this image ...</reminder>" and emits no
@@ -619,24 +682,29 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
 #
 # Measured 2026-08-27: a 10 GiB pin made things WORSE, because skipping the
 # profile also discards the gpu_memory_utilization margin autotune relies on.
-KV_ARGS=()
-if [[ -n "${KV_CACHE_MEMORY:-}" ]]; then
-  KV_ARGS=(--kv-cache-memory "${KV_CACHE_MEMORY}")
-  echo "kv-cache-memory pinned to ${KV_CACHE_MEMORY} bytes ($(( KV_CACHE_MEMORY / 1073741824 )) GiB)"
-fi
+# That was before TORCH_MEM_FRACTION and the ephemeral autotune cache.
+#
+# 26 GiB is the pin that serves under DFlash2. At 28 the head sat near 1 GiB
+# free and eight concurrent long-context requests had a worker OOM-killed. A
+# pin also stops the pool moving by ~0.9 GiB between identical boots with
+# page-cache timing at profiling. DFlash2 costs 41% of the pool: 3,437,736
+# tokens with speculation off against 2,024,644 with it (pre-nightly image,
+# 2026-09-06).
+KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-27917287424}"
+KV_ARGS=(--kv-cache-memory "${KV_CACHE_MEMORY}")
+echo "kv-cache-memory pinned to ${KV_CACHE_MEMORY} bytes ($(( KV_CACHE_MEMORY / 1073741824 )) GiB)"
 
-# lazy, NOT eager. eager stages each shard through anonymous memory and does
-# load faster -- 511 s against 690 s here -- but the buffers are still resident
-# when vLLM profiles for KV, and it measured 6.74 GiB of KV cache against
-# 12.31 GiB on the same boot otherwise: 810,576 tokens against 1,296,922. Three
-# minutes of boot is not worth 38% of the cache on a model this size. qwen38
-# has the headroom to afford it; this does not.
+# eager stages each shard through anonymous memory and loads faster -- 511 s
+# against 690 s for lazy. Unpinned, its buffers were still resident when vLLM
+# profiled for KV and cost 38% of the cache: 810,576 tokens against 1,296,922.
+# With the KV pin above the pool is not profiled, and production runs eager.
+# Go back to lazy if the pin is ever dropped.
 exec vllm serve "$MODEL" \
   --served-model-name "$SERVED" \
   --tensor-parallel-size "$TP" \
   --distributed-executor-backend ray \
   --load-format auto \
-  --safetensors-load-strategy "${SAFETENSORS_LOAD_STRATEGY:-lazy}" \
+  --safetensors-load-strategy "${SAFETENSORS_LOAD_STRATEGY:-eager}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.88}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_e4m3}" \
