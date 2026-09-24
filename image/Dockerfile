@@ -49,7 +49,7 @@ FROM ${BASE}
 
 # nvcc's include path is missing the headers whose libraries this base ships,
 # which breaks any FlashInfer JIT path (nvrtc.h, then -lnvrtc).
-COPY patches/link_cuda_headers.sh /tmp/link_cuda_headers.sh
+COPY image/patches/link_cuda_headers.sh /tmp/link_cuda_headers.sh
 RUN bash /tmp/link_cuda_headers.sh && rm /tmp/link_cuda_headers.sh
 
 # --- sm_121 sparse MLA -------------------------------------------------------
@@ -68,29 +68,29 @@ RUN bash /tmp/link_cuda_headers.sh && rm /tmp/link_cuda_headers.sh
 # allocations byte for byte. The sed retargets MiaAI's path and nothing else,
 # so the vendored file stays verbatim (MIT, licence beside it). The patcher
 # still asserts every anchor matches exactly once.
-COPY patches/glm53-flash_SM121.py patches/LICENSE.MiaAI-Lab /tmp/mia/
+COPY image/patches/glm53-flash_SM121.py image/patches/LICENSE.MiaAI-Lab /tmp/mia/
 RUN sed -i 's|model_executor/layers/sparse_attn_indexer_kpool.py|models/glm5next/nvidia/sparse_indexer.py|' /tmp/mia/glm53-flash_SM121.py \
  && python3 /tmp/mia/glm53-flash_SM121.py && rm -rf /tmp/mia
 
 # MiaAI's patcher and LibertAI's plugin both solve the sm_121 MLA problem, and
 # the first shuts the second out. Make the choice an env var -- see the script.
-COPY patches/gb10_plugin_backend.py /tmp/gb10_plugin_backend.py
+COPY image/patches/gb10_plugin_backend.py /tmp/gb10_plugin_backend.py
 RUN python3 /tmp/gb10_plugin_backend.py && rm /tmp/gb10_plugin_backend.py
 
 # The SM90 backend's metadata builder plans FlashInfer's MLA wrapper with
 # kv_cache_spec.dtype, which for an fp8 cache is the uint8 STORAGE dtype, and
 # plan() rejects it at the first autotune run. The pre-merge image passed
 # float8_e4m3fn; this restores that. Not GB10-specific.
-COPY patches/sm90_fp8_kv_dtype.py /tmp/sm90_fp8_kv_dtype.py
+COPY image/patches/sm90_fp8_kv_dtype.py /tmp/sm90_fp8_kv_dtype.py
 RUN python3 /tmp/sm90_fp8_kv_dtype.py && rm /tmp/sm90_fp8_kv_dtype.py
 
 # Nothing in vLLM bounds a worker's memory, and on unified memory an unbounded
 # worker takes the node down rather than its own request.
-COPY patches/spark_mem_trace.py /usr/local/lib/python3.12/dist-packages/spark_mem_trace.py
-COPY patches/worker_memory_cap.py /tmp/worker_memory_cap.py
+COPY image/patches/spark_mem_trace.py /usr/local/lib/python3.12/dist-packages/spark_mem_trace.py
+COPY image/patches/worker_memory_cap.py /tmp/worker_memory_cap.py
 RUN python3 /tmp/worker_memory_cap.py && rm /tmp/worker_memory_cap.py
 
-COPY patches/spin_wait.py /tmp/spin_wait.py
+COPY image/patches/spin_wait.py /tmp/spin_wait.py
 RUN python3 /tmp/spin_wait.py && rm /tmp/spin_wait.py
 
 # DFlash2 reads auxiliary hidden states from target layers 5, 14, 24, 33, 42.
@@ -98,7 +98,7 @@ RUN python3 /tmp/spin_wait.py && rm /tmp/spin_wait.py
 # states, so without this `--speculative-config dflash` fails at load with
 # "Model does not support EAGLE3 interface". Inert unless a drafter asks for
 # aux layers. Only the target path changed from the vendor-base version.
-COPY patches/glm53_eagle3_aux.py /tmp/glm53_eagle3_aux.py
+COPY image/patches/glm53_eagle3_aux.py /tmp/glm53_eagle3_aux.py
 RUN python3 /tmp/glm53_eagle3_aux.py && rm /tmp/glm53_eagle3_aux.py
 
 # nvidia/GLM-5.3-Flash-NVFP4 stores its MTP layer (45) in BF16, but its
@@ -107,14 +107,14 @@ RUN python3 /tmp/glm53_eagle3_aux.py && rm /tmp/glm53_eagle3_aux.py
 # in RoutedExperts._load_w2. This excludes the MTP layer from quantisation when
 # the checkpoint holds no scales for it -- driven by the weights, so a
 # checkpoint that does quantise its MTP layer is left alone.
-COPY patches/glm53_mtp_bf16.py /tmp/glm53_mtp_bf16.py
+COPY image/patches/glm53_mtp_bf16.py /tmp/glm53_mtp_bf16.py
 RUN python3 /tmp/glm53_mtp_bf16.py && rm /tmp/glm53_mtp_bf16.py
 
 # Thinking off no longer closes an empty <think></think> (out of distribution for
 # this model; it breaks long structured output). The template maps it to
 # `Reasoning Effort: Low` and still opens <think>, so the reasoning parser must
 # track <think> even when the request says thinking is off.
-COPY patches/glm53_reasoning_always_parsed.py /tmp/glm53_reasoning_always_parsed.py
+COPY image/patches/glm53_reasoning_always_parsed.py /tmp/glm53_reasoning_always_parsed.py
 RUN python3 /tmp/glm53_reasoning_always_parsed.py && rm /tmp/glm53_reasoning_always_parsed.py
 
 # DFlash2's drafter adds five sliding-window attention layers, and the nightly's
@@ -123,14 +123,14 @@ RUN python3 /tmp/glm53_reasoning_always_parsed.py && rm /tmp/glm53_reasoning_alw
 # not divisible by the maximum page size"). This keeps the target's groups and
 # gives the drafter layers a group of their own, laid out after the indexer
 # regions and opted out of prefix caching. Inert without a drafter.
-COPY patches/glm53_dflash2_kv_groups.py /tmp/glm53_dflash2_kv_groups.py
+COPY image/patches/glm53_dflash2_kv_groups.py /tmp/glm53_dflash2_kv_groups.py
 RUN python3 /tmp/glm53_dflash2_kv_groups.py && rm /tmp/glm53_dflash2_kv_groups.py
 
 # The fail-closed GLM tool parser, loaded with --tool-parser-plugin. Baked and
 # selected by the entrypoint rather than passed through EXTRA_ARGS: a compose
 # override that restated EXTRA_ARGS dropped it, twice, and production ran the
 # stock parser without anyone noticing.
-COPY patches/glm47_failclosed.py /usr/local/share/glm47_failclosed.py
+COPY image/patches/glm47_failclosed.py /usr/local/share/glm47_failclosed.py
 
 #   iproute2  the entrypoint finds this node's ConnectX address by scanning
 #             `ip -o -4 addr` for CLUSTER_SUBNET, and derives GLOO_SOCKET_IFNAME
@@ -167,12 +167,12 @@ RUN install -m755 /tmp/mentat-out/mentatd /usr/local/bin/mentatd \
 # instrument that sees inside a scheduler tick that never returns.
 RUN pip install --no-cache-dir py-spy && py-spy --version
 
-COPY verify-base.py /tmp/verify-base.py
+COPY image/verify-base.py /tmp/verify-base.py
 RUN python3 /tmp/verify-base.py && rm /tmp/verify-base.py
 
-COPY chat-template.jinja /usr/local/share/glm53-chat-template.jinja
-COPY status-server.py self-test.py /usr/local/bin/
-COPY entrypoint.sh /entrypoint.sh
+COPY image/chat-template.jinja /usr/local/share/glm53-chat-template.jinja
+COPY vllm/status-server.py image/self-test.py /usr/local/bin/
+COPY image/entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/local/bin/status-server.py /usr/local/bin/self-test.py /entrypoint.sh
 
 # 8002 = OpenAI API, 8082 = startup status page, bound from container start
