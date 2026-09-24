@@ -69,12 +69,12 @@ services:
     # compose defaults from the pre-SM90 attempts quietly overriding tuned
     # values (MTP off, GPU_MEM_UTIL 0.86, MAX_MODEL_LEN 131072). The exceptions
     # are the knobs the status server reads itself (SERVICE_NAME, SERVED_NAME,
-    # PEERS, MCP_LOG_DIR, THROUGHPUT_INTERVAL_S): its own defaults are
-    # for another model, and it takes a set-but-empty value as the value.
+    # PEERS, MCP_LOG_DIR, THROUGHPUT_INTERVAL_S). Its own defaults are
+    # generic, not this model's, so they are set here explicitly.
     environment:
       - ROLE=${ROLE:?set ROLE to head or worker in .env}
-      # The status server reads these two itself, and treats a set-but-empty
-      # value as the name, so they carry a default here too.
+      # The status server reads these two itself, and its default name is
+      # "vllm", so they carry a default here too.
       - SERVICE_NAME=${SERVICE_NAME:-glm53}
       - SERVED_NAME=${SERVED_NAME:-glm53}
       # mentat subcluster identity; empty = SERVICE_NAME (the entrypoint's
