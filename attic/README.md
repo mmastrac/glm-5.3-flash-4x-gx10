@@ -1,0 +1,1 @@
+Material no deployment uses: the pre-nightly deployment (bind-mounted host patches and their compose overrides), its rebase notes, and the autotune-cache blessing script the ephemeral cache made obsolete. Kept for the history.

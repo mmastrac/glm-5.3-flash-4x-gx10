@@ -1,0 +1,34 @@
+# Fleet model descriptor. One per container repo, so a box can be planned and
+# a model placed without reading the Dockerfile or the entrypoint. Nothing reads
+# it at run time; where it repeats a value (tp, the KV pin) the one in
+# image/entrypoint.sh is the one that takes effect.
+name: glm53
+huggingface: nvidia/GLM-5.3-Flash-NVFP4     # ModelOpt NVFP4 of zai-org/GLM-5.3-Flash
+
+description: >-
+  David: the fleet's big model, for coding, thinking, planning and management.
+  GLM-5.3-Flash (glm5_next): sparse MLA with a NoPE indexer, KDA, mHC, a 288-
+  expert MoE, multimodal. The minimum model that meets the bar for reasoning
+  here, so it keeps four boxes. Speculates with the separate DFlash2 drafter.
+  Thinking is ON by default; chat_template_kwargs {"enable_thinking": false}
+  turns it down to low reasoning effort, since the model has no real
+  non-thinking mode.
+
+vram:
+  budget_gib: 107.03        # GPU_MEM_UTIL 0.88 of 121.63, per node
+  resident_gib: 91.9        # GPU allocations per rank, all four ranks, measured 2026-09-23
+  kv_pin_bytes: 27917287424 # 26 GiB, KV_CACHE_MEMORY; fp8_e4m3, 2,632,595 tokens with DFlash2
+  notes: >-
+    Four boxes, one rank each. Beside the 91.9 GiB of GPU allocations each node
+    holds 16-20 GiB of process memory and has 1.5-3 GiB free (2026-09-23), so
+    nothing else fits beside it; stop ds4-flash first. GPU_MEM_UTIL 0.90 wedged
+    both ranks after hours of traffic on 2026-08-27; do not raise it.
+
+tp: 4
+pp: 1
+
+api: openai
+endpoints:
+  - /v1/chat/completions
+
+# Smoketests live in smoketest/run.sh:  smoketest/run.sh <base-url> [served-name]

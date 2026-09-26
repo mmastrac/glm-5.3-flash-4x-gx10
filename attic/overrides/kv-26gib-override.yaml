@@ -1,0 +1,6 @@
+# 26 GiB of KV rather than 28, for headroom: at 28 the head sat near 1 GiB free
+# and eight concurrent long-context requests had a worker OOM-killed.
+services:
+  glm53:
+    environment:
+      - 'EXTRA_ARGS=--kv-cache-memory=27917287424 --speculative-config {"method":"dflash","model":"/models/glm-5.3-flash-dflash2","num_speculative_tokens":7}'

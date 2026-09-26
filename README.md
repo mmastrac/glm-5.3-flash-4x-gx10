@@ -1,193 +1,302 @@
-# GLM-5.3-Flash on 4× ASUS GX10 (GB10), TP=4
+# spark-glm53 — David
 
-vLLM TP=4 across four GB10 boxes over RoCE, DFlash2 speculative decoding,
-524k context, on a stock vLLM nightly plus a handful of small patches. Ray is
-replaced by [mentat](https://github.com/mmastrac/mentat).
+GLM-5.3-Flash NVFP4 at TP=4 across four GB10 / ASUS GX10 nodes, one head and
+three workers over the ConnectX fabric, with the DFlash2 drafter. The fleet's
+big model, for coding, thinking, planning and management. It joins the fleet
+through mentat, which places the ranks and lets the router serve it.
 
-Measured 2026-09-23, first-touch, temperature 0, single stream,
-nvidia/GLM-5.3-Flash-NVFP4, both ConnectX-7 PCIe roots in use:
+See [model.yaml](model.yaml) for the weights, footprint and API, and
+[KNOBS.md](KNOBS.md) for the environment contract.
 
-| | |
+| port | what |
 |---|---|
-| prefill @32k | ~2,600 tok/s |
-| prefill @126k | 3,365 tok/s (37.6 s) |
-| decode, counting | 113.7 tok/s |
-| decode, code | 88.6 tok/s |
-| decode, prose | 59.9 tok/s |
-| KV pool | 2,632,595 tokens (26 GiB, fp8_e4m3) |
-| needle recall, 33k and 136k at three depths | 6/6 |
+| 8002 | OpenAI API, head only (`/v1/chat/completions`, `/v1/models`, `/metrics`) |
+| 8082 | status page and MCP (`/mcp`), every rank, from spark-agent |
 
-Hardware: 4× ASUS GX10 (GB10, sm_121a, 128 GB unified), ConnectX-7 200G RoCE
-through a MikroTik CRS812, 10 GbE for management.
-
-## Run it
-
-```
-cp .env.example .env        # on every node; set ROLE, and SPARK_HOME if not /home/admin
-./scripts/up.sh 192.0.2.10 192.0.2.11 192.0.2.12 192.0.2.13   # head first, then workers
-```
-
-`up.sh` starts mentatd on every node, mentatd-serve on the head, then vLLM
-everywhere, and waits for `:8002`.
-
-**Point clients at mentatd-serve on `:6381`, not at vLLM on `:8002`.** It is a
-single OpenAI endpoint for the whole cluster: it health-gates, so a request
-during a boot or a reload queues instead of failing, and it routes by model
-name, so the other models on the fleet answer on the same address. `:8002` is
-one rank of one model and moves whenever the head does. mentatd-serve is a
-separate process from the daemon by design — nothing that routes inference
-traffic runs inside the thing that holds cluster membership.
-
-Build with `docker build -t spark-glm53:v6 image/`. It compiles nothing: the
-base is `vllm/vllm-openai:nightly-0961bbae`, which carries `glm5_next` and
-DFlash2 upstream, and the patches are small anchored edits that fail the build
-if the tree moves under them. The image embeds mentat 0.12.0, which refuses
-daemons older than 0.9, so `mentatd` and `mentatd-serve` must be 0.12.0 too.
-
-## Diagnostics
-
-Each container runs `status-server.py` on `:8082` from container start — before
-the model is loadable, so there is something to read during the ~9 minute weight
-load. It does not proxy inference. `MENTAT_MCP_API` points at it. Eleven MCP
-tools: `node_status`, `cluster_status`, `serve_args`, `ray_status`, `metrics`,
-`throughput`, `latency_percentiles`, `cache_sizes`, `versions`, and
-`find_files` / `search_files` over a fixed set of roots.
-
-> **`:8082` is unauthenticated and binds `0.0.0.0`.** Anyone who can reach the
-> port can read engine state and search file contents under `SEARCH_ROOTS`
-> (`/src/vllm,/root/.cache,/logs,/cache` by default). Paths are resolved with
-> `realpath` so symlinks cannot escape those roots, arguments are passed as
-> argv rather than through a shell, and output is capped at 16 KB — but there
-> is no authentication. Fine on an isolated fabric; put it behind something, or
-> narrow `SEARCH_ROOTS`, on any network you do not control.
-
-Host-level facts — GPU, PCI, RDMA counters, memory accounting, dmesg, systemd —
-come from a separate per-machine agent that is **not** part of this recipe. It
-runs outside the container because those facts are the host's, and it
-authenticates with the mesh key. The container tools above cover the engine;
-diagnosing the fabric or the box needs that agent or plain ssh.
-
-## Tuning
-
-This is tuned for one or two interactive users, not for a serving fleet. The
-bias throughout is that **a long prefill must never block a short request**, and
-that a single stream should be fast, rather than maximising aggregate
-throughput at concurrency.
-
-| knob | value | why |
-|---|---|---|
-| `LONG_PREFILL_TOKEN_THRESHOLD` | 2304 | Caps one prefill's share of each scheduler step. Left at the default (budget − 256) a 120k prefill takes the whole step and a 12-token request waits 78–90 s; at 2304 it waits ~5 s. Must be a multiple of 2304, the KDA block size, because prefix caching snaps chunk ends to it — 2048 yields alternating 2048/256-token chunks. Costs nothing: the 200k prefill got *faster*. |
-| `MAX_NUM_BATCHED_TOKENS` | 16384 | Measured indistinguishable from 8192 at 200k once chunks are capped. |
-| `KV_CACHE_MEMORY` | 26 GiB | 2.63M tokens with DFlash2. Pin it explicitly — `--gpu-memory-utilization` then becomes decorative and vLLM says so at startup. |
-| `FABRIC_SUBNETS` | both roots | Each GB10's ConnectX-7 sits on two PCIe roots and one root tops out near 110 Gb/s. NCCL over both took a 126k prefill from 2,412 to 3,365 tok/s; decode did not move. Needs an IPv4 on the second root's interface in its own subnet, MTU 9000, and the same RoCE v2 GID index on both roots. At TP=4 it cost no measurable headroom. |
-| `MAX_NUM_SEQS` | 32 | With DFlash2 k=7 a decode step costs 1+k=8 token slots per sequence, so 32 sequences exactly consume a 256-token reserve. |
-| DFlash2 `k=7` | | Roughly doubles decode against MTP k=4 on this model. Costs ~41% of the KV pool: 3.44M tokens with speculation off, 2.02M with it at the same pin. |
-| `busy_loop_s` | 0.002 | See Patches. Raises decode and drops the SoC ~20 °C. |
-| `GPU_MEM_UTIL` | 0.88 | 0.90 passes every startup check and wedges the box hours later. See Troubleshooting. |
-
-If you are serving many concurrent users instead, raise `MAX_NUM_SEQS`, drop
-the KV pin back toward 20 GiB for single-stream speed, and consider leaving
-`LONG_PREFILL_TOKEN_THRESHOLD` unset — the fairness reserve costs a solo user
-about 5% and buys nothing when every step has several requests in it anyway.
-
-## Patches
-
-Applied at build time from `image/patches/`; each asserts its anchor matches
-exactly once. `image/verify-base.py` then checks the finished tree, reading files
-as text (an import-based check needs a GPU driver that does not exist during
-`docker build`).
-
-| file | what it does | source |
-|---|---|---|
-| `glm53-flash_SM121.py` | Makes the model run on GB10 at all. On capability 12 the nightly offers only `FLASHINFER_MLA_SPARSE_SM120`, which needs the packed `fp8_ds_mla` layout with `pe_dim == 64`; this checkpoint is NoPE, so the engine dies in `concat_and_cache_mla` after a full weight load. Lists the SM90 sparse-MLA path for capability 12 and swaps FA3 for FA2. The Dockerfile retargets one of its paths to the nightly's `models/glm5next/` layout. | [MiaAI-Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark), MIT |
-| `sm90_fp8_kv_dtype.py` | The SM90 backend planned an fp8 KV cache as uint8. | ours |
-| `gb10_plugin_backend.py` | Lets `VLLM_GLM53_CUDA_SPARSE_MLA` pick between the two sm_121 MLA kernels, which otherwise collide silently. | ours |
-| `glm53_mtp_bf16.py` | nvidia's `config.json` says the MTP layer is NVFP4, but its weights are BF16, so MTP dies at load. Excludes it from quantisation when the checkpoint holds no scales for it. | ours |
-| `glm53_eagle3_aux.py` | DFlash2 reads auxiliary hidden states from target layers 5, 14, 24, 33 and 42; upstream GLM5next does not expose them. | ours |
-| `glm53_dflash2_kv_groups.py` | The GLM-5-Next KV grouper gives up on the drafter's sliding-window layers and the model dies unifying page sizes. Keeps the target's groups and adds the drafter's. | ours |
-| `glm53_reasoning_always_parsed.py` | Thinking off maps to low reasoning effort (see Troubleshooting), so the model always emits a short `<think>` block. Stock `glm47_moe` stops parsing `<think>` when thinking is off, and the trace would land in `content`. | ours |
-| `glm47_failclosed.py` | Tool-call parser plugin (`--tool-call-parser glm47_failclosed`). Checks each call against the tools the request offered; a call with a bad name or argument keys comes back as a retryable call whose sentinel argument names the mistake, instead of being dropped or leaking into history. Containment, not a cure. | ours, after [NNNtrance](https://github.com/NNNtrance/GLM-5.3-Flash-EXL3-DGX-Spark) #7 and #11 |
-| `spin_wait.py` | vLLM's shm queue spins for `busy_loop_s` (1 s) after each message; on GB10 the CPU and GPU share one power budget, so the spin costs ~20 °C and decode. 0.002 keeps the fast path; 0 (always block) measured slower. | [nacyot](https://artifacts.nacyot.com/vllm-spin-wait-gb10-en/) |
-| `worker_memory_cap.py` | Caps each worker's share of unified memory (`TORCH_MEM_FRACTION`). vLLM never calls `set_per_process_memory_fraction`, so nothing else bounds a worker. | ours |
-| `spark_mem_trace.py` | Names whatever crosses that bound, instead of leaving an OOM anonymous. | ours |
-| `link_cuda_headers.sh` | The base ships CUDA libraries without their headers where nvcc looks, which breaks FlashInfer JIT at link time. | ours |
-
-The old recipe's `gb10_topk_fallback.py` is now a flag
-(`--sparse-indexer-topk-backend per_row`), and `thinking_budget_guard.py` is
-upstream.
-
-## Troubleshooting
-
-**Prefill at half speed, every metric healthy.** If NCCL all-reduce crawls
-(~12 Gb/s) while `ib_write_bw` reads a healthy 109 Gb/s and no error counter
-moves, the ConnectX-7 has latched a slow fallback state from the DAC cables
-being hot-plugged. **Power off and unplug for a minute** — a reboot does not
-clear it, and neither does a NIC hotplug reset. The tell is that NCCL Tree
-beats Ring; healthy is Ring 110 Gb/s, Tree 44. A single unidirectional stream
-cannot see this, which is why the RDMA test passes; a ring collective, sending
-and receiving at once, can.
-
-**The box wedges hours after a clean start.** `GPU_MEM_UTIL=0.90` passes every
-startup check and is worth +28% KV, then takes the node down with no ssh, no
-userspace and ping only. Unified memory means the CUDA allocation *is* host
-memory, so none of it is reclaimable and the OOM killer cannot help. 0.88 is the
-committed value.
-
-**Long output repeats or skips when thinking is off.** "Count from 1 to 200"
-comes back as `35 36 37 37`, or jumps ahead, or starts copying the prompt. This
-is the model, not the stack. GLM-5.3-Flash has no non-thinking mode: its official
-template always opens `<think>` under `Reasoning Effort: Max`, and an empty
-`<think></think>` is out of distribution. Every checkpoint (nvidia, RedHatAI,
-the official FP8), both MoE kernels, TP=2 and TP=4, and Hugging Face's own
-`glm5_next` implementation fail the same way. This recipe's template maps
-`thinking: false` / `enable_thinking: false` to `Reasoning Effort: Low` instead:
-a few dozen tokens of reasoning and a clean answer. `reasoning_effort` (`low`,
-`high`, default `max`) also works directly, at the top level of the request.
-
-**Intermittent corrupted tokens.** The modelopt NVFP4 build emits them
-mid-word, inside rare tokens — invisible in English, reproducible with a Korean
-prompt, and identical under both MoE kernels, both attention backends, and with
-speculation off. The compressed-tensors builds (RedHatAI NVFP4, INT4 AWQ) are
-clean on the same stack. Independently reported by tonyd2wild.
-
-**Boot hangs at `waiting for 4 GPUs, have 1`.** Every node must set `HEAD_HOST`
-to the head, not to itself. mentat replicates an agent's *registration* across
-the mesh but not its *liveness*: point a node at its own daemon and the head
-lists the agent yet marks it `alive=false degraded=true`, while that node's own
-daemon sees only its own agent. The GPU gate asks whichever daemon it was told
-about, so it never counts more than one. Confirm with `mentatd status` on the
-head — every agent should read `alive=true`.
-
-**The second boot deadlocks after NCCL setup.** A persisted FlashInfer autotune
-cache keys some MoE entries per rank, so rank 0 loads a tuning the others lack
-and they wait on each other forever. The entrypoint keeps the cache ephemeral on
-TP>1 and wipes it at every start; `AUTOTUNE_CACHE=persist` brings the old
-behaviour back.
-
-**The first request after a cold boot takes minutes.** Triton JIT compiling
-DFlash2 shapes mid-serve; `jit_monitor` names them in the log. Send one
-throwaway request before timing anything.
-
-**A value in `.env` does nothing.** `.env` only substitutes into the compose
-files; a variable reaches the container only if `glm53.yaml` lists it under
-`environment`. Compose files layer in order and the last wins.
+DS4-Flash uses 8001/8081, so both can be configured on one node, though only
+one fits in its memory.
 
 ## Layout
 
-```
-compose/    glm53.yaml + dflash2.yaml (DFlash2 speculation), mentatd, mentatd-serve
-image/      the whole build context: Dockerfile, entrypoint, chat template,
-            status-server.py (status page + engine MCP tools on :8082),
-            self-test.py, verify-base.py, and patches/
-scripts/    up.sh, down.sh
-```
+| path | what |
+|---|---|
+| `image/` | Dockerfile, entrypoint, patches, `verify-base.py`, `self-test.py`, chat template, `build.sh` |
+| `compose/glm53.yaml` | the deployment, the same file on every node |
+| `.env.example` | per-host and per-node values; copy to `compose/.env` |
+| `smoketest/` | `run.sh <base> [served-name]` |
+| `.submodules/spark-agent` | the status server, reached through the `vllm` symlink |
+| `dev/` | not in the image: the corruption diagnosis and repros, kernel and patch tests, the step tap |
+| `attic/` | used by no deployment: the pre-nightly host patches and overrides |
 
-## Credits
+## Build
 
-[mmastrac/mentat](https://github.com/mmastrac/mentat) ·
-[tonyd2wild](https://github.com/tonyd2wild) ·
-[MiaAI-Lab](https://github.com/MiaAI-Lab) (sm_121 patches, see
-`patches/LICENSE.MiaAI-Lab`) ·
-[tonyliu312](https://github.com/tonyliu312) (28 GiB KV pin) ·
-[nacyot](https://artifacts.nacyot.com/vllm-spin-wait-gb10-en/) (spin wait) ·
-[alexellis](https://github.com/alexellis/glm-5.3-flash-4x-dgx-spark-switchless)
+    git clone --recursive ...        # or: git submodule update --init
+    image/build.sh                   # -> spark-glm53:v8
+    TAG=spark-glm53:v9 image/build.sh
+    BASE=... image/build.sh          # override the pinned nightly
+
+The build context is the repo root, so the `vllm` symlink into the submodule
+stays inside it. Build on a box that will run it; there is no cross-build for
+aarch64 here. A plain `rsync -a` copy of the repo builds, because it keeps the
+hidden `.submodules/` and the symlink; a bare `scp -r *` misses the first.
+Build once and pull from the other three nodes; every rank must run the same
+image.
+
+## Run
+
+On every node:
+
+    cp .env.example compose/.env     # then fill it in; ROLE and VLLM_HOST_IP differ per node
+    docker compose -f compose/glm53.yaml up -d
+
+Compose reads `.env` from `compose/`, beside the compose file. The project name
+is pinned to `glm53`; a stack started under another project name (a directory
+named after the deployment, say) must be taken down first, or the two collide
+on the container name.
+
+GLM-5.3-Flash and DS4-Flash **cannot coexist**: GLM's weights alone are
+~90.7 GiB of each node's 121.6 GiB. Stop DS4 first.
+
+Either side may start first from cold: `ray start` under mentat retries until
+the daemon answers, and the head waits for all four GPUs before it loads.
+
+**Replacing a running stack is different.** Recreating all four ranks in
+parallel lets a starting rank join a group that is still tearing down, and the
+whole group then hangs just past NCCL setup: every rank `running`, RestartCount
+0, CPU ~1%, no weights loading, and nothing in any log after the
+`custom_all_reduce` warning. Seen on 2026-09-10 after several rapid recreate
+cycles. Take every rank down, confirm all four containers are gone, then start
+the head and the workers a few seconds later.
+
+    # on each node
+    docker compose -f compose/glm53.yaml down --timeout 60
+    # confirm: docker ps -a | grep glm53  ->  nothing, on all four
+    # then head first, workers after
+
+Then check it: `smoketest/run.sh http://<head>:8002`, or through mentat-serve.
+
+## Roll back
+
+The compose file here leaves every tuned knob to the image's entrypoint, and
+images up to v7 carry the old defaults (TP=2, MTP, a 262144 window). So an
+older image goes back with its own compose file and `.env`, not with this one:
+keep the previous deployment directory (`glm53.yaml` + `dflash2.yaml` and a
+`.env` that sets every tuned knob) until v8 has served, then `down` here and
+`up -d` there. That tree is commit `9c9c3e1`.
+
+The pre-nightly deployment, a per-model base image plus 16 vLLM source files
+bind-mounted from five compose overrides, is in `attic/` for the record.
+
+## On a vLLM nightly since 2026-09-23
+
+Stock `vllm/vllm-openai:nightly-0961bbae` plus the patches listed in the
+Dockerfile header, with nothing mounted over the image. Every file the old
+deployment bind-mounted is now upstream, a flag, or a small anchored patch
+baked into the image.
+
+Measured on the same four nodes, thinking off, median of 3, 2026-09-23:
+
+| | old sm90-v21 + DFlash2 | v4 + DFlash2 |
+|---|---|---|
+| decode structured / code / prose | 105.8 / 71.9 / 50.7 tok/s | 104.4 / 79.1 / 53.4 |
+| acceptance | 89.0 / 58.3 / 36.0 % | 88.5 / 65.0 / 38.2 % |
+| prefill 31.6k / 126k | 2,229 / 2,176 tok/s | 2,389 / 2,421 |
+| KV pool at the 26 GiB pin | 2.02M tokens | 2.63M |
+| needle 33k+136k | 6/6 | 6/6 |
+| greedy @42k, 8 runs | 7 distinct | 4 distinct |
+
+v6 (thinking off as low effort, below) decodes 109.8 / 88.8 / 52.6 on the same
+three, because DFlash2's acceptance rose. MTP (the checkpoint's own head,
+`SPEC_METHOD=mtp`) also works, and decoded 57.2 / 54.4 / 45.6 on v4: correct,
+but DFlash2 is what carries structured and code.
+
+### What it took, in the order it broke
+
+1. mentat 0.7.0 refuses a bare `ray start --head` while `RAY_ADDRESS` is set.
+   The entrypoint passes `--address`.
+2. The MTP layer of nvidia/GLM-5.3-Flash-NVFP4 is BF16 but `config.json` says
+   NVFP4 (`image/patches/glm53_mtp_bf16.py`).
+3. The SM90 sparse-MLA builder planned an fp8 KV cache as uint8
+   (`image/patches/sm90_fp8_kv_dtype.py`).
+4. The GLM-5-Next KV grouper drops out on the drafter's sliding-window layers
+   (`image/patches/glm53_dflash2_kv_groups.py`, tested by
+   `dev/patch-tests/_glm53_dflash2_kv_groups_test.py`).
+5. A persisted FlashInfer autotune cache deadlocks the next TP=4 boot: rank 0
+   saves per-rank MoE entries the others then miss. The entrypoint keeps it
+   ephemeral and wipes it on every start.
+
+mentat drops a remote rank's traceback, so a worker that raises during setup
+shows only the message on the head. To see the stack, bind-mount a copy of
+`ray/_host.py` with `traceback.print_exc()` added to both `except BaseException`
+handlers; that is how 2 and 3 were found.
+
+## The model
+
+320B total / 18B active, natively multimodal MoE, `Glm5NextForConditionalGeneration`.
+45 layers split **34 KDA linear-attention + 11 DeepSeek-sparse-attention**, 288
+routed experts (8 active + 1 shared), an MTP head, 1M context.
+
+Only the 11 sparse layers carry a KV cache and they use `kv_lora_rank: 512`, so
+KV is cheap and the memory pressure is essentially all weights. The 26 GiB pin
+holds 2,632,595 tokens with DFlash2 at a 524288 window, 5.02 full-length
+requests (2026-09-23).
+
+The KDA layers keep one recurrent state per sequence, allocated after weights,
+and exactly 32 fit (2026-08-26). That, not throughput, caps `MAX_NUM_SEQS`.
+
+## Why NVFP4 and not the official checkpoint
+
+Measured when the model was released (2026-08-26), at TP=2:
+
+| checkpoint | size | per node at TP=2 | fits? |
+|---|---|---|---|
+| BF16 | 598.5 GiB | 299 GiB | no |
+| FP8 e4m3 (the default) | 305.8 GiB | 153 GiB | **no** — 121.6 GiB per node |
+| NVFP4 | **181.3 GiB** | **90.7 GiB** | yes |
+
+Sizes are from the safetensors indexes, not estimates. The routed experts are
+NVFP4; both attention flavours, the vision tower, shared experts, routers,
+embeddings and `lm_head` stay BF16. The deployed checkpoint is nvidia's
+(`nvidia/GLM-5.3-Flash-NVFP4`); the LibertAIDAI and RedHat quants were served
+before it.
+
+**There is no usable GGUF.** llama.cpp has no `glm5_next` support, so the GGUF
+repos on HF are not loadable by anything.
+
+## What the image is
+
+A pinned vLLM nightly plus anchored patches, each described in the Dockerfile
+header, and:
+
+- **mentat** — the daemon binary as `ray`, `mentatd-probe-machine`, and the
+  shim wheel. TP=4 across four boxes needs real placement, which a TP=1 tenant
+  gets from `ray.register` alone.
+- **iproute2 and ibverbs** — the entrypoint finds this node's fabric interface
+  with `ip`, and NCCL needs ibverbs for RoCE (without it NCCL falls back to TCP
+  over the LAN and every step crawls). Not replaceable by a hardcoded interface
+  name: the nodes carry the link on different ports.
+- **spark-agent's status server**, plus ripgrep, pciutils and usbutils for its
+  tools.
+
+GB10 is sm_121 and the nightly's torch reports up to sm_120. That reads like a
+blocker and is not one: sm_120 cubins run on sm_121. `verify-base.py` asserts
+it, with every patch marker, the `ray` binary and `ray.register`, so a rebased
+base fails the build instead of producing an image that loads ~90 GiB and then
+dies.
+
+## Why it loads plain safetensors
+
+`--load-format auto`, and deliberately no sharded-state cache. The fast-boot
+cache is dumped *after* the NVFP4 kernel-format transform, so loading one
+re-runs that transform, permutes the fused gate/up halves and serves fluent
+nonsense with no error. `ds4-flash/vllm-spark.patch` carries the
+`IDEMPOTENT-GUARD` that prevents this; **this image does not carry it**, so the
+only safe load is the one that runs the transform exactly once.
+
+Adopt the sharded-state cache only together with that patch. The cost of not
+having it is boot time, which is CPU-bound on weight processing.
+
+## PP is off, and turning it on needs files this repo no longer has
+
+`pp-mtp-override.yaml` was in the old deployment until 2026-09-10. Every file
+it mounted was PP-only or inert at `pipeline_parallel_size=1`: two activate
+solely when `VLLM_NCCL_NET_*` is set, `mtp.py` is gated on
+`get_pp_group().world_size > 1`, `speculative.py` computed the value PP=1
+already yields, and its `model.py` and `model_runner.py` were shadowed by the
+dflash copies at the same destinations. Removing it left draft acceptance at
+1.79 of 7 against a control of 1.75, and decode medians of 41.1 against 38.9
+with spreads of 9.4 and 6.0. Its files are in git history; port them before
+raising PP above 1.
+
+## The RoCE GID index is per node and per boot
+
+The entrypoint derives `NCCL_IB_GID_INDEX` at start; do not pin it. The RoCE
+GID table is indexed by (address, RoCE version) in the order addresses
+appeared, so nodes do not agree and a removed address leaves a hole. Read on
+2026-08-26 from two nodes:
+
+| node | RoCE device | table | value |
+|---|---|---|---|
+| A | `rocep1s0f1` | 0,1,2,**hole**,4,5,6 | **6** |
+| B | `rocep1s0f0` | 0,1,2,3,4,5 | **5** |
+
+Reboot A with the static profile in place and its table comes up dense, moving
+6 to 5, so a pinned 6 names an empty slot and NCCL fails every TP init. To read
+a table:
+
+    for i in $(seq 0 9); do p=/sys/class/infiniband/<dev>/ports/1; \
+      echo "$i $(cat $p/gid_attrs/types/$i) $(cat $p/gids/$i)"; done
+
+The right entry is the RoCE v2 one for the node's own static fabric address,
+unlike the IPv6 link-locals, which regenerate.
+
+## Thinking off needs a patch in the checkpoint directory
+
+The template decides this, not the flag. `image/chat-template.jinja` carries
+the fix, and the Dockerfile bakes it to
+`/usr/local/share/glm53-chat-template.jinja`. **That copy is not always the one
+used.** The entrypoint prefers the checkpoint's own template whenever it finds
+`<|begin_of_image|>` in it, deliberately, because the baked one would otherwise
+cost image support on a checkpoint that has its own. So a checkpoint shipping
+an image-capable template silently shadows the baked fix, and thinking off
+breaks again with nothing in any log.
+
+The nvidia checkpoint is such a checkpoint, so its own `chat_template.jinja` is
+patched in place on each node, with the original kept beside it
+(`<MODEL_HOST_DIR>/chat_template.jinja.pre-effortfix`). **This reverts on any
+checkpoint swap or model re-sync.** Re-apply the edit, validate that the
+template renders before deploying (`jinja2.Environment(extensions=
+["jinja2.ext.loopcontrols"])` — the template uses `{% break %}`; run it inside
+the container), then run the smoketest, whose thinking cases check both modes.
+Checking only that `reasoning` is empty is not enough — it is empty in the
+broken state too, with the monologue sitting in `content`.
+
+### Thinking off is outside what the model was trained on
+
+The official template (zai-org FP8, and the RedHat checkpoint) has no
+non-thinking mode at all: every kwarg renders
+`<|system|>Reasoning Effort: Max ... <|assistant|><think>`. Our first fix
+closed the block empty (`<think></think>`), and long structured output then
+degraded. Measured 2026-09-23, "count from 1 to 200", temperature 0:
+
+| mode | nvidia NVFP4, cutlass, MTP | official FP8, triton |
+|---|---|---|
+| thinking on (default) | clean 8/8 | clean 6/6 |
+| thinking off (`<think></think>`) | corrupt 3-8 of 8 | corrupt 8/8 |
+
+The failures are repeats (`35 36 37 37`), skips, or a jump to copying the prompt
+text. Every checkpoint (nvidia, RedHat, official FP8), both MoE backends,
+weight-only marlin everywhere, fp8 or bf16 KV, TP=2 or 4, graphs or eager, and
+the old sm90-v21 image all fail the thinking-off probe the same way. It is not
+a serving bug: the per-layer references in `dev/kernel-tests/*_ref.py` match
+the decode path. Short answers and the Korean corruption probe are fine with
+thinking off; long repetitive output is not.
+
+**Since v6, thinking off means low effort.** The official template takes
+`reasoning_effort` (`low`, `high`, anything else is `max`), passed at the top
+level of the request or in `chat_template_kwargs`. `image/chat-template.jinja`
+maps `thinking: false` / `enable_thinking: false` to `Reasoning Effort: Low`
+(an explicit `reasoning_effort` wins) and always opens `<think>`.
+`image/patches/glm53_reasoning_always_parsed.py` makes the reasoning parser
+track `<think>` on every request, since stock glm47_moe stops parsing it when
+either kwarg is false and the short trace would land in `content`. Measured on
+v6 (2026-09-23): thinking off gives ~67 reasoning chars and a clean count 6/6.
+
+## Weights live on local disk, per node
+
+Every rank reads the whole checkpoint under `--load-format auto`, so each node
+needs its own copy at `MODEL_HOST_DIR`, and the DFlash2 drafter at
+`DFLASH_HOST_DIR`. Local rather than NFS on purpose: the NFS models mount races
+the network at boot and fails (seen on one node on 2026-08-26, and on the two
+boots before it), and a model that only starts when the NAS is awake will
+eventually fail to start. `hf download` is resumable.
+
+## Not yet measured
+
+- `NCCL_MAX_NCHANNELS=8` was chosen on 2026-09-06 while the fabric ran at
+  12 Gb/s, before a power drain fixed it. NCCL's own choice is untested since.
+- Why production moved from marlin to `flashinfer_cutlass` on 2026-09-21 is not
+  recorded. It passes the thinking-on corruption probe; the greedy
+  determinism repros in `dev/repro/` were measured on marlin.
+- The mentat endpoints in port form (`8002/v1`, `8082/mcp`) have not yet run on
+  this model: v7 and earlier announced URLs built from `VLLM_HOST_IP`.

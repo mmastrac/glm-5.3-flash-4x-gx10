@@ -1,0 +1,17 @@
+# Two confirmed defects, bind-mounted so a compose recreate cannot drop them
+# (they were container-layer edits once, and a `compose up` did exactly that).
+#
+# mamba_hybrid.py: build_attn_metadata was called without `positions=`, which
+# defaults to None, so indexer.py skipped compute_kpool_tail_slot_mapping
+# entirely. The generic kernel then read a zero column from a one-wide tail
+# block table and collapsed every token past index_kpool onto tail block 0,
+# with concurrent requests sharing one ring. Only default.py passed positions.
+#
+# indexer.py: that mapping returned a per-step clone, whose address a FULL
+# cudagraph captures and whose storage is freed after the step. It now writes
+# into a persistent buffer.
+services:
+  glm53:
+    volumes:
+      - /home/admin/kpool-fix/mamba_hybrid.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_states/mamba_hybrid.py:ro
+      - /home/admin/kpool-fix/indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py:ro
