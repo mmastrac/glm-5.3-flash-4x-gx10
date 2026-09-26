@@ -5,15 +5,13 @@
 #   docker compose -f compose/glm53.yaml up -d
 # Compose reads .env from this file's directory, not the working directory.
 #
-# Ordering: with a mentat image (sm90-v5 onward), either side may start
-# first -- registration retries forever, and the host-level mentatd
-# (mentatd.yaml from https://github.com/mmastrac/mentat) just has to be
-# running on both boxes. On a real-ray fallback image the old rule still
-# applies: head FIRST, then wait for its stage file to read waiting-workers
-# (`ray start --address` does not retry).
+# Ordering: from cold, any rank may start first -- registration retries
+# forever, and the host-level mentatd (mentatd.yaml from
+# https://github.com/mmastrac/mentat) just has to be running on every box. Replacing a running stack is different: take all four
+# ranks down first (README, "Replacing a running stack").
 #
-# GLM-5.3-Flash and DS4-Flash CANNOT COEXIST. GLM's weights alone are ~90.7 GiB
-# per node out of 121.6 GiB, so stop ds4-flash before bringing this up.
+# Nothing else fits beside it. GLM's weights alone are ~90.7 GiB per node out
+# of 121.6 GiB, so stop any other model on these boxes first.
 #
 # network_mode: host is required -- RoCE/NCCL needs the real interfaces, and
 # Ray's actor ports are not practically mappable.
@@ -43,12 +41,12 @@ services:
     devices:
       - /dev/infiniband:/dev/infiniband
     volumes:
-      # The full 181 GiB checkpoint, read-only. Unlike ds4-flash there is no
-      # transcoded cache: this image loads plain safetensors, so BOTH ranks read
-      # the whole checkpoint and it must be present on EACH node's local disk.
-      # Local rather than NFS on purpose -- the models mount races the network at
-      # boot and fails (seen on one node on 2026-08-26), and a model that only starts
-      # when the NAS is awake will eventually fail to start.
+      # The full 181 GiB checkpoint, read-only. There is no transcoded cache:
+      # this image loads plain safetensors, so EVERY rank reads the whole
+      # checkpoint and it must be present on EACH node's local disk.
+      # Local rather than NFS on purpose -- an NFS mount races the network at
+      # boot and fails (seen on one node on 2026-08-26), and a model that only
+      # starts when the NAS is awake will eventually fail to start.
       - ${MODEL_HOST_DIR:?set MODEL_HOST_DIR in .env}:/models/glm-5.3-flash-nvfp4:ro
       # The DFlash2 drafter, also on every node: speculation runs on every TP
       # rank. A separate Qwen3-based model that reads auxiliary hidden states
@@ -71,12 +69,12 @@ services:
     # compose defaults from the pre-SM90 attempts quietly overriding tuned
     # values (MTP off, GPU_MEM_UTIL 0.86, MAX_MODEL_LEN 131072). The exceptions
     # are the knobs the status server reads itself (SERVICE_NAME, SERVED_NAME,
-    # PEERS, MCP_LOG_DIR, THROUGHPUT_INTERVAL_S): its own defaults are
-    # ds4-flash's, and it takes a set-but-empty value as the value.
+    # PEERS, MCP_LOG_DIR, THROUGHPUT_INTERVAL_S). Its own defaults are
+    # generic, not this model's, so they are set here explicitly.
     environment:
       - ROLE=${ROLE:?set ROLE to head or worker in .env}
-      # The status server reads these two itself, and treats a set-but-empty
-      # value as the name, so they carry a default here too.
+      # The status server reads these two itself, and its default name is
+      # "vllm", so they carry a default here too.
       - SERVICE_NAME=${SERVICE_NAME:-glm53}
       - SERVED_NAME=${SERVED_NAME:-glm53}
       # mentat subcluster identity; empty = SERVICE_NAME (the entrypoint's
@@ -207,10 +205,11 @@ services:
       # config", so the pin is not a fix for a warmup OOM -- lower GPU_MEM_UTIL
       # or the pin for that.
       - KV_CACHE_MEMORY=${KV_CACHE_MEMORY:-}
-      # auto (bf16), NOT fp8: fp8 selects the fp8_ds_mla packed format, which
-      # hardcodes pe_dim == 64. This model is NoPE sparse MLA (qk_rope_head_dim
-      # is 0), so that kernel refuses at KV cache init -- after a full 10-minute
-      # weight load. Do not copy ds4-flash's fp8 here; DS4 is DeepSeek geometry.
+      # Empty = fp8_e4m3, the entrypoint's default and what every measurement
+      # here used. Never plain `fp8`: that selects the fp8_ds_mla packed format,
+      # which hardcodes pe_dim == 64. This model is NoPE sparse MLA
+      # (qk_rope_head_dim is 0), so that kernel refuses at KV cache init --
+      # after a full 10-minute weight load.
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
       # Left EMPTY on purpose so the entrypoint owns the defaults. A default
       # here as well as there means two places to change and one silently
@@ -228,19 +227,18 @@ services:
       - CUDAGRAPH_METRICS=${CUDAGRAPH_METRICS:-}
       - ITERATION_DETAILS=${ITERATION_DETAILS:-}
       # Empty = 8002 (API) and 8082 (status page and MCP), from the
-      # entrypoint. ds4-flash uses 8001/8081, so both fit on one node's ports
-      # even though only one fits in its memory.
+      # entrypoint.
       - API_PORT=${API_PORT:-}
       - STATUS_PORT=${STATUS_PORT:-}
       # Status-page peers, host:port, comma-separated. Empty shows this node
-      # alone; mentat-serve and the agent give the cluster view.
+      # alone; mentatd-serve gives the cluster view.
       - PEERS=${PEERS:-}
       - MCP_LOG_DIR=${MCP_LOG_DIR:-/logs}
       # mentat's agent id is group@container@node_ip. Without this the agent
       # falls back to the hostname, which under network_mode: host is the
       # HOST's name, so every container on a node would claim the same id.
       - CONTAINER_NAME=${CONTAINER_NAME:-glm53}
-      # What the agent announces to mentat-serve. Empty = port form (8002/v1,
+      # What the agent announces to mentatd-serve. Empty = port form (8002/v1,
       # 8082/mcp), which the router resolves against every address the node
       # announces. A URL pins one address. A worker holds a TP rank and
       # answers no requests, so the entrypoint drops its OpenAI endpoint
