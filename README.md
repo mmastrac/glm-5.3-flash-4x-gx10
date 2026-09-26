@@ -94,7 +94,8 @@ bind-mounted from five compose overrides, is in `attic/` for the record.
 
 ## On a vLLM nightly since 2026-09-23
 
-Stock `vllm/vllm-openai:nightly-0961bbae` plus the patches listed in the
+Stock `vllm/vllm-openai:nightly-ddd6fbca` (v8, 2026-09-26; v4 to v7 used
+`nightly-0961bbae`), plus FlashKDA 17a037d and the patches listed in the
 Dockerfile header, with nothing mounted over the image. Every file the old
 deployment bind-mounted is now upstream, a flag, or a small anchored patch
 baked into the image.

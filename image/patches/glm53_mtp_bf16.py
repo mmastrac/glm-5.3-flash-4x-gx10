@@ -26,9 +26,10 @@ from pathlib import Path
 
 PATH = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/mtp.py")
 
+# The layer passes vllm_config to its decoder layer, which reads the shared
+# quant config itself, so the exclusion goes onto that object before it is built.
 OLD = """        config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
-        quant_config = vllm_config.quant_config
 """
 NEW = """        config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config

@@ -28,6 +28,12 @@ because of `wgmma`; that was wrong, and it cost a working configuration.
 The rest handle FlashInfer's FA2 fp8 gate and CTA tile for GB10's ~101 KB smem,
 turn PDL off (KDA race on this hardware), and fix indexer/kpool details.
 
+Two of its targets have moved since it was written: the indexer allocation now
+lives in `models/glm5next/nvidia/sparse_indexer.py`, and FlashInfer 0.7.0 moved
+the FA2 fp8 gate into `mla/_batch_mla/_backends/_fa_common.py`.
+`mia_retarget.py` rewrites those paths and anchors in a copy before it runs, so
+this file stays verbatim.
+
 The script asserts every replacement matches exactly once and aborts otherwise,
 so a base-image change fails the build rather than silently producing a
 half-patched tree. Drop it once these land upstream.
