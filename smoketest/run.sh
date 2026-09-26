@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoketests for glm53 (David). See lib.sh for the conventions.
+# Smoketests for glm53. See lib.sh for the conventions.
 #
 # These test what clients rely on, not raw capability. The one that matters
 # most here is fluency-vs-correctness: a TP/shard/quantisation mismatch on this
