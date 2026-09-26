@@ -87,7 +87,7 @@ images up to v7 carry the old defaults (TP=2, MTP, a 262144 window). So an
 older image goes back with its own compose file and `.env`, not with this one:
 keep the previous deployment directory (`glm53.yaml` + `dflash2.yaml` and a
 `.env` that sets every tuned knob) until v8 has served, then `down` here and
-`up -d` there. That tree is commit `9c9c3e1`.
+`up -d` there. That tree is commit `dde02f4`.
 
 The pre-nightly deployment, a per-model base image plus 16 vLLM source files
 bind-mounted from five compose overrides, is in `attic/` for the record.
@@ -296,6 +296,12 @@ needs its own copy at `MODEL_HOST_DIR`, and the DFlash2 drafter at
 the network at boot and fails (seen on one node on 2026-08-26, and on the two
 boots before it), and a model that only starts when the NAS is awake will
 eventually fail to start. `hf download` is resumable.
+
+The drafter,
+[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2),
+is licensed CC BY-NC-ND 4.0, non-commercial. Check that before you serve it.
+`SPEC_METHOD=mtp` uses the checkpoint's own MTP head instead, slower but with no
+second download.
 
 ## Not yet measured
 
