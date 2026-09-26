@@ -5,19 +5,20 @@ RoCE, with DFlash2 speculative decoding and a 524k context window. The base
 is a stock vLLM nightly plus a handful of small patches and a newer FlashKDA.
 Ray is replaced by [mentat](https://github.com/mmastrac/mentat).
 
-Measured 2026-09-23 on the previous nightly (0961bbae), first-touch,
-temperature 0, single stream, nvidia/GLM-5.3-Flash-NVFP4, both ConnectX-7 PCIe
-roots in use. The current nightly (ddd6fbca) has not been measured yet.
+Measured 2026-09-26 on this image (nightly ddd6fbca), temperature 0, single
+stream, nvidia/GLM-5.3-Flash-NVFP4, both ConnectX-7 PCIe roots in use. Prefill
+is first-touch (`dev/repro/prefill.py`). Decode is thinking off, 512 tokens,
+median of 3 (`dev/repro/decode.py`), with DFlash2 acceptance beside it.
 
 | | |
 |---|---|
-| prefill @32k | ~2,600 tok/s |
-| prefill @126k | 3,365 tok/s (37.6 s) |
-| decode, counting | 113.7 tok/s |
-| decode, code | 88.6 tok/s |
-| decode, prose | 59.9 tok/s |
+| prefill @32k | 2,730 tok/s |
+| prefill @124k | 2,679 tok/s (46.2 s) |
+| decode, counting | 109.9 tok/s (97% accepted) |
+| decode, code | 84.4 tok/s (75%) |
+| decode, prose | 38.4 tok/s (25%) |
 | KV pool | 2,632,595 tokens (26 GiB, fp8_e4m3) |
-| needle recall, 33k and 136k at three depths | 6/6 |
+| needle recall, 34k and 145k at three depths | 6/6 |
 
 [model.yaml](model.yaml) has the checkpoints and the memory footprint, and
 [KNOBS.md](KNOBS.md) lists every environment variable the entrypoint reads.

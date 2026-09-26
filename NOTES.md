@@ -179,6 +179,28 @@ track `<think>` on every request, since stock glm47_moe stops parsing it when
 either kwarg is false and the short trace would land in `content`. Measured on
 v6 (2026-09-23): thinking off gives ~67 reasoning chars and a clean count 6/6.
 
+## v8 against v7, 2026-09-26
+
+Same four boxes and scripts, v7 measured just before the switch. v7 ran with
+two overrides that v8 has built in: the SM90 kpool plan (vllm#58704) and fp32
+FlashKDA state (vllm#58846).
+
+| | v7 | v8 |
+|---|---|---|
+| decode counting / code / prose | 101.4 / 75.6 / 34.1 tok/s | 109.9 / 84.4 / 38.4 |
+| acceptance | 96.1 / 72.2 / 23.5 % | 97.2 / 74.7 / 24.5 |
+| prefill @31k / @117-124k | 2,699 / 2,662 tok/s | 2,730 / 2,679 |
+| tool-call probe, 40 runs at 42k | 19 agree with the majority | 22 |
+| boot to API | ~10 min | 7.5 min (weights 238 s) |
+
+Prefill is at parity. The first long prompt after a boot measured 2,309 tok/s
+and is left out: it pays for JIT compiles. The tool-call probe still diverges,
+with 14 and 16 distinct completions, so read 19 against 22 as noise.
+
+Neither image reproduces the 3,365 tok/s at 126k measured on 2026-09-23, with
+NCCL on both roots on every box. Check the fabric for a latched slow link
+before blaming the image.
+
 ## Not yet measured
 
 - `NCCL_MAX_NCHANNELS=8` was chosen on 2026-09-06 while the fabric ran at
@@ -186,5 +208,3 @@ v6 (2026-09-23): thinking off gives ~67 reasoning chars and a clean count 6/6.
 - Why production moved from marlin to `flashinfer_cutlass` on 2026-09-21 is not
   recorded. It passes the thinking-on corruption probe; the greedy
   determinism repros in `dev/repro/` were measured on marlin.
-- The mentat endpoints in port form (`8002/v1`, `8082/mcp`) have not yet run on
-  this model: v7 and earlier announced URLs built from `VLLM_HOST_IP`.
