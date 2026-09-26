@@ -1,9 +1,9 @@
-# spark-glm53 — David
+# GLM-5.3-Flash on 4x ASUS GX10
 
 GLM-5.3-Flash NVFP4 at TP=4 across four GB10 / ASUS GX10 nodes, one head and
-three workers over the ConnectX fabric, with the DFlash2 drafter. The fleet's
-big model, for coding, thinking, planning and management. It joins the fleet
-through mentat, which places the ranks and lets the router serve it.
+three workers over the ConnectX fabric, with the DFlash2 drafter. The ranks
+join through [mentat](https://github.com/mmastrac/mentat), a Ray replacement
+that places them and lets its router serve the model.
 
 See [model.yaml](model.yaml) for the weights, footprint and API, and
 [KNOBS.md](KNOBS.md) for the environment contract.
@@ -13,8 +13,13 @@ See [model.yaml](model.yaml) for the weights, footprint and API, and
 | 8002 | OpenAI API, head only (`/v1/chat/completions`, `/v1/models`, `/metrics`) |
 | 8082 | status page and MCP (`/mcp`), every rank, from spark-agent |
 
-DS4-Flash uses 8001/8081, so both can be configured on one node, though only
-one fits in its memory.
+## Before you start
+
+Every node runs mentatd, and one node runs mentatd-serve if you want the router
+in front. Both come from the mentat repo, which has the compose files and
+setup: `mentatd.yaml` on every node, `mentatd-serve.yaml` on one. The four
+nodes need the ConnectX fabric cabled and addressed; see "The RoCE GID index
+is per node and per boot" below.
 
 ## Layout
 
@@ -54,8 +59,8 @@ is pinned to `glm53`; a stack started under another project name (a directory
 named after the deployment, say) must be taken down first, or the two collide
 on the container name.
 
-GLM-5.3-Flash and DS4-Flash **cannot coexist**: GLM's weights alone are
-~90.7 GiB of each node's 121.6 GiB. Stop DS4 first.
+GLM's weights alone take ~90.7 GiB of each node's 121.6 GiB, so nothing else
+large fits beside it.
 
 Either side may start first from cold: `ray start` under mentat retries until
 the daemon answers, and the head waits for all four GPUs before it loads.
