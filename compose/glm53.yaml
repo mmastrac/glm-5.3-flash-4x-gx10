@@ -93,7 +93,7 @@ services:
       - CLUSTER_SUBNET=${CLUSTER_SUBNET:?set CLUSTER_SUBNET in .env}
       # One subnet per ConnectX PCIe root NCCL should use, space-separated. Each
       # names an interface; the entrypoint maps it to its RDMA device and GID.
-      # Both roots made a 126k prefill 40% faster on TP=4 (2026-09-23). Empty =
+      # Both roots made a 126k prefill 11% faster on TP=4 (2026-09-26). Empty =
       # CLUSTER_SUBNET only, one root.
       - FABRIC_SUBNETS=${FABRIC_SUBNETS:-}
       # How long to wait for the fabric and for the peer's GPUs before giving

@@ -197,14 +197,44 @@ Prefill is at parity. The first long prompt after a boot measured 2,309 tok/s
 and is left out: it pays for JIT compiles. The tool-call probe still diverges,
 with 14 and 16 distinct completions, so read 19 against 22 as noise.
 
-Neither image reproduces the 3,365 tok/s at 126k measured on 2026-09-23, with
-NCCL on both roots on every box. Check the fabric for a latched slow link
-before blaming the image.
+## Both ConnectX roots, 2026-09-26
+
+The 3,365 tok/s at 126k recorded on 2026-09-23 was a partial prefix-cache hit.
+The benchmark seeded its random words by seed alone and sized the prompt from a
+calibration run, so two runs with the same seed and slightly different
+calibrations shared every word up to the shorter length. Reproduced: the same
+seed with a different calibration measured 3,391 and 3,396 tok/s, with ~30k
+tokens served from the cache. Fresh seeds measure ~2,680 on v7 and v8 alike.
+
+Measured with the model stopped, all-reduce bus bandwidth across the four boxes
+(bf16, 134 MB to 1 GB, `NCCL_MAX_NCHANNELS=8` unless noted):
+
+| | Gb/s |
+|---|---|
+| both roots, NCCL's choice | 175-191 |
+| both roots, Ring | 180-191 |
+| both roots, Tree | 55-93 |
+| one root | 95-111 |
+| both roots, 16 channels | 156-160 |
+
+Ring far ahead of Tree is the healthy ordering; the latched slow state after
+a DAC hot-plug reverses it. First-touch prefill, fresh random words, after a
+warm-up request:
+
+| | 32k | 126k |
+|---|---|---|
+| one root | 2,470 tok/s | 2,412 |
+| both roots | 2,750 | 2,680 |
+
+So the second root is worth 11% of prefill, not 40%. Collectives are a
+minority of prefill time, which is why doubling their bandwidth moves it this
+little.
 
 ## Not yet measured
 
 - `NCCL_MAX_NCHANNELS=8` was chosen on 2026-09-06 while the fabric ran at
-  12 Gb/s, before a power drain fixed it. NCCL's own choice is untested since.
+  12 Gb/s, before a power drain fixed it. On the healthy fabric 16 channels
+  measured slower than 8 (above); NCCL's own choice, with no cap, is untested.
 - Why production moved from marlin to `flashinfer_cutlass` on 2026-09-21 is not
   recorded. It passes the thinking-on corruption probe; the greedy
   determinism repros in `dev/repro/` were measured on marlin.
