@@ -1,18 +1,18 @@
-# Fleet model descriptor. One per container repo, so a box can be planned and
-# a model placed without reading the Dockerfile or the entrypoint. Nothing reads
-# it at run time; where it repeats a value (tp, the KV pin) the one in
-# image/entrypoint.sh is the one that takes effect.
+# Model descriptor, so a box can be planned without reading the Dockerfile or
+# the entrypoint. Nothing reads it at run time except smoketest/run.sh, which
+# takes the served name from it. Where it repeats a value (tp, the KV pin),
+# the one in image/entrypoint.sh is the one that takes effect.
 name: glm53
 huggingface: nvidia/GLM-5.3-Flash-NVFP4     # ModelOpt NVFP4 of zai-org/GLM-5.3-Flash
+drafter: incoai/GLM-5.3-Flash-DFlash2       # DFlash2, k=7, 2.2 GiB, mounted at DFLASH_HOST_DIR
 
 description: >-
-  David: the fleet's big model, for coding, thinking, planning and management.
   GLM-5.3-Flash (glm5_next): sparse MLA with a NoPE indexer, KDA, mHC, a 288-
-  expert MoE, multimodal. The minimum model that meets the bar for reasoning
-  here, so it keeps four boxes. Speculates with the separate DFlash2 drafter.
-  Thinking is ON by default; chat_template_kwargs {"enable_thinking": false}
-  turns it down to low reasoning effort, since the model has no real
-  non-thinking mode.
+  expert MoE, multimodal. Served across four GB10 boxes for coding, thinking
+  and planning, the smallest model that met the bar for reasoning here.
+  Speculates with the separate DFlash2 drafter. Thinking is ON by default;
+  chat_template_kwargs {"enable_thinking": false} turns it down to low
+  reasoning effort, since the model has no real non-thinking mode.
 
 vram:
   budget_gib: 107.03        # GPU_MEM_UTIL 0.88 of 121.63, per node
@@ -21,8 +21,8 @@ vram:
   notes: >-
     Four boxes, one rank each. Beside the 91.9 GiB of GPU allocations each node
     holds 16-20 GiB of process memory and has 1.5-3 GiB free (2026-09-23), so
-    nothing else fits beside it; stop ds4-flash first. GPU_MEM_UTIL 0.90 wedged
-    both ranks after hours of traffic on 2026-08-27; do not raise it.
+    nothing else fits beside it. GPU_MEM_UTIL 0.90 wedged both ranks after
+    hours of traffic on 2026-08-27; do not raise it.
 
 tp: 4
 pp: 1
