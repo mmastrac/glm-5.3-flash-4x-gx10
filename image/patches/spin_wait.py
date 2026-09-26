@@ -5,8 +5,8 @@ vLLM's MessageQueue readers spin for `busy_loop_s` after each read before they
 start sleeping. At the default of 1 s every TP rank spins almost continuously,
 and on GB10 that spin is not free: CPU and GPU share one thermal and power
 budget, so it cost ~20 C and measurable decode. 0.002 keeps the fast path for
-back-to-back steps; always-blocking (0) measured WORSE. See the fleet notes,
-"vLLM spin-wait steals GB10 thermal budget".
+back-to-back steps; always-blocking (0) measured WORSE. After
+https://artifacts.nacyot.com/vllm-spin-wait-gb10-en/.
 
 Replaces the whole-file mount of shm_broadcast.py the old deployment used.
 Same contract as the other patchers: one anchor, exactly once, or the build

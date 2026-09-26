@@ -1,0 +1,3 @@
+[submodule ".submodules/spark-agent"]
+	path = .submodules/spark-agent
+	url = https://github.com/mmastrac/spark-agent.git

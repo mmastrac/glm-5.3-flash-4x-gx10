@@ -1,0 +1,17 @@
+# The build context is the repo root, so the vllm symlink resolves inside it.
+# Denylist rather than allowlist: the Dockerfile's COPY lines are the list of
+# what goes in, and this only keeps the upload small. The status server under
+# .submodules/spark-agent/vllm/ must stay.
+.git
+.submodules/*/.git
+.submodules/spark-agent/agent
+attic/
+dev/
+smoketest/
+compose/
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+.DS_Store
+*.md

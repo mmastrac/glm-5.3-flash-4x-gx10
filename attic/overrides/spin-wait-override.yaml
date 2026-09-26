@@ -1,0 +1,10 @@
+# vLLM's shm queue spins for busy_loop_s after the last message before it will
+# block on zmq. The default is 1s and decode messages arrive every few ms, so
+# the sleep path is never taken and the cores spin at full power. On GB10 the
+# CPU and GPU share one package: measured here, 1 -> 0.002 dropped vLLM CPU
+# 185% -> 109%, the SoC ~20C, and RAISED decode 66.9 -> 70.6 tok/s.
+# 0 (always block) is cooler still but costs 11% decode to zmq wakeup latency.
+services:
+  glm53:
+    volumes:
+      - /home/admin/spin-patch/shm_broadcast.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/shm_broadcast.py:ro

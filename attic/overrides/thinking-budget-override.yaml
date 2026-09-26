@@ -1,0 +1,10 @@
+# thinking_token_budget is applied inside apply_sampling_params, which the V2
+# sampler skips whenever _requires_logits_processing() is false -- true for
+# temperature 0 (greedy) and temperature 1 (this model's generation_config
+# default). The budget was therefore silently ignored on the most common
+# requests. Upstream main fixes the same gap with a per-request
+# needs_logits_processing flag; this adds the missing condition.
+services:
+  glm53:
+    volumes:
+      - /home/admin/thinking-budget-patch/sampler.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/sample/sampler.py:ro

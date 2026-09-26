@@ -6,6 +6,7 @@ loaded ~90 GiB per node over ten minutes, and then died or served nonsense.
 Failing the BUILD is far cheaper. Checks both what the nightly must provide
 and that every patch actually landed.
 """
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +58,12 @@ if "GLM53-MTP-BF16" not in (V / "models/glm5next/common/mtp.py").read_text():
     problems.append("MTP bf16 exclusion missing (glm53_mtp_bf16.py)")
 if "SupportsEagle3" not in (V / "models/glm5next/common/model.py").read_text():
     problems.append("GLM5next has no aux hidden states (glm53_eagle3_aux.py)")
+if "vllm_config.num_speculative_tokens" not in (V / "models/glm5next/common/attention.py").read_text():
+    problems.append("kpool tail ring not sized for spec decode (vllm#58454 missing from the base)")
+if "_index_expert_mapping" not in (V / "model_executor/layers/fused_moe/routed_experts.py").read_text():
+    problems.append("RoutedExperts scans the expert mapping per tensor (vllm-58720-routed-experts.patch)")
+if not (V / "FLASHKDA_REF").read_text().startswith("17a037d"):
+    problems.append("_flashkda_C is not FlashKDA 17a037d (vllm#58846 builder stage)")
 if "GLM53-REASONING-ALWAYS" not in (V / "parser/glm47_moe.py").read_text():
     problems.append("reasoning parser drops <think> when thinking is off (glm53_reasoning_always_parsed.py)")
 if "busy_loop_s: float = 0.002," not in (V / "distributed/device_communicators/shm_broadcast.py").read_text():
@@ -71,6 +78,14 @@ try:
 except Exception as e:
     problems.append(f"`ray` executable missing: {e!r}")
 
+# The shim package, whose ray.register module is how a TP=1 stack joins
+# without the daemon binary. Missing, a container starts and serves and never
+# appears in the router.
+try:
+    importlib.import_module("ray.register")
+except Exception as e:
+    problems.append(f"mentat ray.register not importable: {e!r}")
+
 import shutil
 if not shutil.which("mentatd-probe-machine"):
     problems.append("mentatd-probe-machine missing: `ray start` would register zero GPUs")
@@ -79,4 +94,4 @@ if problems:
     for p in problems:
         print(f"IMAGE CHECK FAILED: {p}", file=sys.stderr)
     sys.exit(1)
-print("image ok: Glm5Next, glm45, glm47_failclosed, sm_120, MiaAI SM90 + indexer, spin-wait, mentat ray")
+print("image ok: Glm5Next, glm45, glm47_failclosed, sm_120, MiaAI SM90 + indexer, spin-wait, FlashKDA 17a037d, mentat ray + ray.register")

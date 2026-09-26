@@ -6,7 +6,7 @@ Loaded with `--tool-parser-plugin` and selected with
 ## Why
 
 The forward pass is not bit-reproducible at M >> 1 on this hardware (see
-../TOPK-CORRUPTION.md), and the token it lands on is occasionally part of a tool
+../../dev/TOPK-CORRUPTION.md), and the token it lands on is occasionally part of a tool
 call. Upstream handles a corrupted *name* by dropping the call: the turn ends
 `stop` with no content and no `tool_calls`, which clients report as a dead
 endpoint. It does not check argument *keys* at all, so a call carrying a garbage
